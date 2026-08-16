@@ -1,11 +1,14 @@
 // 每日畅听会员领取插件
 // 通过 ctx.kugou 复用宿主登录态调用酷狗 API（插件不接触用户令牌），
-// 领取 1 天畅听会员（含升级），并展示当月领取记录。
+// 领取 1 天畅听会员（含升级），并展示当月领取记录与实时到期/领取统计。
 //
-// 入口分布（v1.1）：
+// 入口分布（v1.2）：
 // - 个人中心「会员状态」下方嵌入领取卡片（MutationObserver 自愈注入）
 // - 插件设置项（设置 → 插件管理 → 本插件）：自动领取开关 + 快速领取卡片
 // - 独立页面（无侧边栏入口，可通过命令/快捷键打开）：/main/plugin/daily-vip-claim/claim
+//
+// 自动领取：启动 5 秒后、系统休眠唤醒、运行中每小时各检查一次；
+// 用当月记录预判「今日已领」，命中则静默跳过，避免重复领取请求与 131001 噪音。
 
 // ---- 模块级辅助函数（与宿主内置实现逐一对齐） ----
 
@@ -25,6 +28,7 @@ const formatSecondsDate = (value) => {
 // 酷狗 API 已知错误码 → 友好提示映射
 const VIP_ERROR_HINTS = {
   131001: '今日已领取，明天再来',
+  20018: '登录已过期，请重新登录',
   // 后续发现新错误码在此追加
 };
 
@@ -46,14 +50,43 @@ const getApiErrorMessage = (error, fallback) => {
 const isClaim131001 = (error) =>
   Number(error?.response?.body?.error_code) === 131001;
 
-// 领取 1 天 VIP → 升级为畅听会员（升级可选：失败不阻断领取结果）
-const claimOnce = async (ctx) => {
-  await ctx.kugou.user.claimDayVip(formatClaimDate());
-  try {
-    await ctx.kugou.user.upgradeDayVip();
-  } catch (upgradeError) {
-    console.warn('[daily-vip-claim] 升级失败（非阻断）:', upgradeError);
+// ---- 单飞锁：领取 + 升级共享同一 in-flight Promise，防止三处入口/自动任务并发重复请求 ----
+
+let claimInFlight = null;
+
+const claimOnce = (ctx) => {
+  if (claimInFlight) return claimInFlight;
+  claimInFlight = (async () => {
+    await ctx.kugou.user.claimDayVip(formatClaimDate());
+    try {
+      await ctx.kugou.user.upgradeDayVip();
+    } catch (upgradeError) {
+      console.warn('[daily-vip-claim] 升级失败（非阻断）:', upgradeError);
+    }
+  })().finally(() => {
+    claimInFlight = null;
+  });
+  return claimInFlight;
+};
+
+// ---- 当月记录（带 5 分钟缓存，卡片三处挂载与自动领取预判复用） ----
+
+const MONTH_RECORD_TTL = 5 * 60 * 1000;
+let monthRecordCache = { at: 0, value: [] };
+
+const getMonthRecordsCached = async (ctx) => {
+  if (Date.now() - monthRecordCache.at < MONTH_RECORD_TTL) {
+    return monthRecordCache.value;
   }
+  const res = await ctx.kugou.user.getVipMonthRecord();
+  const records = normalizeVipRecords(res);
+  monthRecordCache = { at: Date.now(), value: records };
+  return records;
+};
+
+const isTodayClaimed = (records) => {
+  const today = formatClaimDate();
+  return (records ?? []).some((r) => r && r.date === today);
 };
 
 // 防御式解析当月领取记录（响应结构随酷狗上游可能变化）
@@ -89,6 +122,36 @@ const normalizeVipRecords = (res) => {
       return { date, label: '已领取 1 天畅听会员' };
     })
     .filter((item) => item !== null);
+};
+
+// ---- VIP 到期读取（与 Profile 同源：读宿主 Pinia user store 的 busi_vip） ----
+
+const readTvipEndTime = (ctx) => {
+  try {
+    const store = ctx.pinia && ctx.pinia._s && ctx.pinia._s.get('user');
+    const busiVip =
+      (store && store.info && store.info.extendsInfo && store.info.extendsInfo.vip && store.info.extendsInfo.vip.busi_vip) || [];
+    const tvip = busiVip.find(
+      (v) => v && v.product_type === 'tvip' && v.is_vip === 1,
+    );
+    return tvip ? tvip.vip_end_time : null;
+  } catch {
+    return null;
+  }
+};
+
+// 到期时间 → 友好文案（天粒度）
+const formatExpiryText = (value) => {
+  if (!value) return '--';
+  try {
+    const end = new Date(value);
+    if (Number.isNaN(end.getTime())) return '--';
+    const diffDays = Math.ceil((end.getTime() - Date.now()) / 86400000);
+    if (diffDays <= 0) return '已过期';
+    return `${diffDays}天后到期`;
+  } catch {
+    return '--';
+  }
 };
 
 // 免请求的登录预检：读宿主持久化的用户 store（KV key: pinia:user）。
@@ -131,8 +194,9 @@ const iconSvg = (h, iconData, { size = 18, className = '' } = {}) =>
     innerHTML: iconData?.body ?? '',
   });
 
-// 领取卡片共享状态/动作（页面、设置项、个人中心注入三处复用）
-const createClaimState = (ctx) => {
+// ---- 领取卡片共享状态/动作 ----
+// onAfterClaim：领取成功后回调（卡片用它刷新到期/统计状态）
+const createClaimState = (ctx, onAfterClaim) => {
   const { ref } = ctx.vue;
 
   const isClaiming = ref(false);
@@ -144,8 +208,7 @@ const createClaimState = (ctx) => {
     if (isLoadingRecords.value) return;
     isLoadingRecords.value = true;
     try {
-      const res = await ctx.kugou.user.getVipMonthRecord();
-      records.value = normalizeVipRecords(res);
+      records.value = await getMonthRecordsCached(ctx);
       showRecords.value = true;
       if (records.value.length === 0) {
         ctx.toast.info('本月暂无领取记录');
@@ -176,8 +239,12 @@ const createClaimState = (ctx) => {
     isClaiming.value = true;
     try {
       await claimOnce(ctx);
-      ctx.toast.success('已领取 1 天畅听会员');
+      ctx.toast.show('已领取 1 天畅听会员', 'success', 4000, {
+        label: '查看记录',
+        handler: () => loadRecords(),
+      });
       refreshUserInfoBestEffort(ctx);
+      if (onAfterClaim) onAfterClaim();
       if (showRecords.value) await loadRecords();
     } catch (error) {
       console.warn('[daily-vip-claim] 领取失败:', error);
@@ -198,12 +265,22 @@ const createClaimState = (ctx) => {
   };
 };
 
-// 自动领取：今日已领取（131001）静默跳过；网络等失败等待后重试一次
-const runAutoClaim = async (ctx) => {
+// ---- 自动领取（幂等）：启动 5s / 系统唤醒 / 每小时 各检查一次 ----
+const maybeAutoClaim = async (ctx) => {
   const ok = await isLoggedInCached(ctx);
   if (ok === false) {
     console.info('[daily-vip-claim] 自动领取跳过：未登录');
     return;
+  }
+  // 预判今日已领：命中则静默跳过，不打领取请求
+  try {
+    const records = await getMonthRecordsCached(ctx);
+    if (isTodayClaimed(records)) {
+      console.info('[daily-vip-claim] 自动领取跳过：今日已领取');
+      return;
+    }
+  } catch (error) {
+    console.warn('[daily-vip-claim] 预检领取记录失败，尝试直接领取:', error);
   }
   for (let attempt = 0; attempt <= 1; attempt += 1) {
     try {
@@ -322,6 +399,14 @@ const CSS = `
   font-weight: 700;
   color: var(--color-text-secondary, rgba(148, 163, 184, 0.9));
   opacity: 0.6;
+}
+
+.dvp-status {
+  margin-top: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--color-text-secondary, rgba(148, 163, 184, 0.9));
+  opacity: 0.75;
 }
 
 .dvp-records-head {
@@ -509,12 +594,39 @@ const createClaimCard = (ctx, Button) => {
       variant: { type: String, default: 'card' },
     },
     setup(props) {
-      const state = createClaimState(ctx);
       const loggedIn = ref(null); // null = 检查中/未知，true/false = 已确认
+      const vipExpiry = ref('--');
+      const monthCount = ref(null);
+      const claimedToday = ref(false);
+
+      const refreshStatus = async () => {
+        vipExpiry.value = formatExpiryText(readTvipEndTime(ctx));
+        try {
+          const records = await getMonthRecordsCached(ctx);
+          monthCount.value = records.length;
+          claimedToday.value = isTodayClaimed(records);
+        } catch (error) {
+          console.warn('[daily-vip-claim] 读取领取统计失败:', error);
+          monthCount.value = null;
+        }
+      };
+
+      const state = createClaimState(ctx, () => {
+        // 领取成功后延迟刷新状态（等宿主 store 拉新 VIP 到期时间）
+        setTimeout(refreshStatus, 1000);
+      });
 
       onMounted(async () => {
         loggedIn.value = await isLoggedInCached(ctx);
+        if (loggedIn.value !== false) await refreshStatus();
       });
+
+      const statusParts = () => {
+        const parts = [`畅听到期 ${vipExpiry.value}`];
+        if (monthCount.value != null) parts.push(`本月已领 ${monthCount.value} 天`);
+        if (claimedToday.value) parts.push('今日已领取');
+        return parts.join(' · ');
+      };
 
       return () =>
         h(
@@ -558,6 +670,7 @@ const createClaimCard = (ctx, Button) => {
                     { default: () => (state.isClaiming.value ? '领取中' : '领取') },
                   ),
             ]),
+            loggedIn.value !== false ? h('div', { class: 'dvp-status' }, statusParts()) : null,
             ...renderRecords(state),
           ],
         );
@@ -784,7 +897,7 @@ export function activate(ctx) {
               h(
                 'div',
                 { class: 'dvp-setting-hint' },
-                '应用启动 5 秒后自动领取；今日已领取时静默跳过，失败自动重试一次',
+                '启动 / 休眠唤醒 / 每小时检查一次；今日已领取时静默跳过，失败自动重试一次',
               ),
             ]),
             h(Switch, {
@@ -805,23 +918,55 @@ export function activate(ctx) {
     component: SettingsPanel,
   });
 
-  // 4. 自动领取（启动 5 秒后执行一次；今日已领取时静默跳过）
+  // 4. 自动领取（启动 5s 后、系统唤醒、每小时各检查一次）
   let disposed = false;
+  let autoTimer = null;
+  let autoInterval = null;
+  let resumeDisposer = null;
+
   void (async () => {
+    let autoEnabled = false;
     try {
-      if (!(await ctx.storage.get('autoClaim'))) return;
+      autoEnabled = Boolean(await ctx.storage.get('autoClaim'));
     } catch {
-      return;
+      // 读取失败视为未开启
     }
-    setTimeout(() => {
-      if (disposed) return;
-      void runAutoClaim(ctx);
+    if (!autoEnabled) return;
+
+    autoTimer = setTimeout(() => {
+      if (!disposed) void maybeAutoClaim(ctx);
     }, 5000);
+    autoInterval = setInterval(() => {
+      if (!disposed) void maybeAutoClaim(ctx);
+    }, 60 * 60 * 1000);
+    try {
+      resumeDisposer = ctx.electron?.power?.onResume(() => {
+        if (!disposed) void maybeAutoClaim(ctx);
+      });
+    } catch (error) {
+      console.warn('[daily-vip-claim] 注册唤醒监听失败:', error);
+    }
   })();
 
   disposeAll = () => {
     if (disposed) return;
     disposed = true;
+    if (autoTimer) {
+      clearTimeout(autoTimer);
+      autoTimer = null;
+    }
+    if (autoInterval) {
+      clearInterval(autoInterval);
+      autoInterval = null;
+    }
+    if (resumeDisposer) {
+      try {
+        resumeDisposer();
+      } catch {
+        // 忽略
+      }
+      resumeDisposer = null;
+    }
     disposeProfile();
   };
 }

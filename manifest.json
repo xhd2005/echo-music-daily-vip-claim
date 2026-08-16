@@ -1,9 +1,9 @@
 {
   "id": "daily-vip-claim",
   "name": "每日畅听会员领取",
-  "version": "1.1.0",
-  "description": "每日领取 1 天畅听会员：个人中心会员状态下方直达，插件设置项可自定义自动领取",
-  "author": "EchoMusic",
+  "version": "1.2.0",
+  "description": "每日领取 1 天畅听会员：个人中心会员状态下方直达，实时到期/本月已领统计，启动/唤醒/每小时自动领取",
+  "author": "xhd2005",
   "icon": "logo.png",
   "main": "index.js",
   "capabilities": { "kugouApi": true },
