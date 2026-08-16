@@ -1,7 +1,7 @@
 # 每日畅听会员领取
 
 <p align="center">
-  <img src="icon.svg" alt="icon" width="96" height="96" />
+  <img src="logo.png" alt="logo" width="96" height="96" />
 </p>
 
 <p align="center">
@@ -85,7 +85,7 @@
 echo-music-daily-vip-claim/
 ├── manifest.json   # 插件清单（id / 名称 / 能力声明 kugouApi）
 ├── index.js        # 插件入口（activate / deactivate，渲染函数，无需构建）
-├── icon.svg        # 插件图标
+├── logo.png        # 插件图标
 ├── README.md       # 本文件
 └── LICENSE         # GPL-3.0
 ```
