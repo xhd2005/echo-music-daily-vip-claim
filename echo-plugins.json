@@ -1,0 +1,10 @@
+{
+  "name": "xhd2005 的 EchoMusic 插件源",
+  "homepage": "https://github.com/xhd2005/echo-music-daily-vip-claim",
+  "plugins": [
+    {
+      "id": "daily-vip-claim",
+      "tags": ["vip", "会员", "畅听", "每日领取"]
+    }
+  ]
+}

@@ -35,7 +35,15 @@
 
 插件市场搜索「每日畅听会员领取」安装（上架后可用）。
 
-**方式三：源码安装**
+**方式三：插件源导入（本仓库）**
+
+1. EchoMusic → 设置 → 插件管理 → 插件市场 → 右上角「插件源」
+2. 添加地址：`https://github.com/xhd2005/echo-music-daily-vip-claim`
+3. 在市场列表中找到「每日畅听会员领取」→ 安装
+
+> 插件源通过仓库根目录的 [`echo-plugins.json`](echo-plugins.json) 索引解析插件；拉取失败时可在 EchoMusic 设置中配置 GitHub 代理（如 `https://gh-proxy.com/`）。
+
+**方式四：源码安装**
 
 把仓库根目录（`manifest.json` 所在目录）整体复制为：
 
