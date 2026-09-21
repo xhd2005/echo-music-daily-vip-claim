@@ -50,19 +50,291 @@ const getApiErrorMessage = (error, fallback) => {
 const isClaim131001 = (error) =>
   Number(error?.response?.body?.error_code) === 131001;
 
+// ---- SQLite 本地打卡流水账本 ----
+
+const LEDGER_DB_NAME = 'vip_claim_ledger';
+let ledgerDb = null;
+
+const initLedgerDb = async (ctx) => {
+  if (!ctx.sqlite || typeof ctx.sqlite.open !== 'function') return null;
+  try {
+    const res = await ctx.sqlite.open({
+      name: LEDGER_DB_NAME,
+      migrations: [
+        {
+          version: 1,
+          sql: [
+            `CREATE TABLE IF NOT EXISTS claim_ledger (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id TEXT NOT NULL DEFAULT '',
+              claim_date TEXT NOT NULL,
+              claimed_at INTEGER NOT NULL,
+              expiry_text TEXT NOT NULL DEFAULT '',
+              upgrade_status INTEGER NOT NULL DEFAULT 0,
+              concept_task_status INTEGER NOT NULL DEFAULT 0,
+              duration_ms INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'success',
+              message TEXT NOT NULL DEFAULT ''
+            );`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_claim_ledger_day ON claim_ledger(user_id, claim_date);`,
+            `CREATE INDEX IF NOT EXISTS idx_claim_ledger_time ON claim_ledger(claimed_at);`,
+          ],
+        },
+        {
+          version: 2,
+          sql: [
+            `ALTER TABLE claim_ledger ADD COLUMN concept_task_status INTEGER NOT NULL DEFAULT 0;`,
+          ],
+        },
+      ],
+    });
+    if (res.ok) {
+      ledgerDb = res;
+      return ledgerDb;
+    }
+  } catch (err) {
+    console.warn('[daily-vip-claim] 打开 SQLite 本地账本异常:', err);
+  }
+  return null;
+};
+
+const recordClaimLedger = async ({
+  userId = '',
+  claimDate,
+  claimedAt = Date.now(),
+  expiryText = '',
+  upgradeStatus = 0,
+  conceptTaskStatus = 0,
+  durationMs = 0,
+  status = 'success',
+  message = '',
+}) => {
+  if (!ledgerDb) return;
+  try {
+    await ledgerDb.run(
+      `INSERT OR REPLACE INTO claim_ledger
+        (user_id, claim_date, claimed_at, expiry_text, upgrade_status, concept_task_status, duration_ms, status, message)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        String(userId || ''),
+        claimDate,
+        claimedAt,
+        String(expiryText || ''),
+        upgradeStatus ? 1 : 0,
+        conceptTaskStatus ? 1 : 0,
+        durationMs,
+        status,
+        String(message || ''),
+      ],
+    );
+  } catch (err) {
+    console.warn('[daily-vip-claim] 写入 SQLite 账本失败:', err);
+  }
+};
+
+const getLedgerStats = async (userId = '') => {
+  if (!ledgerDb) return { totalSuccess: 0, savedMoney: 0, recentLogs: [] };
+  try {
+    const totalRes = await ledgerDb.get(
+      `SELECT COUNT(*) AS total FROM claim_ledger WHERE status = 'success' ${
+        userId ? 'AND (user_id = ? OR user_id = "")' : ''
+      }`,
+      userId ? [String(userId)] : [],
+    );
+    const totalSuccess = Number(totalRes?.row?.total || 0);
+    // 酷狗畅听 VIP 市价折合约 0.5 元/天
+    const savedMoney = Math.round(totalSuccess * 0.5 * 10) / 10;
+    const logsRes = await ledgerDb.all(
+      `SELECT * FROM claim_ledger ${
+        userId ? 'WHERE user_id = ? OR user_id = ""' : ''
+      } ORDER BY claimed_at DESC LIMIT 30`,
+      userId ? [String(userId)] : [],
+    );
+    return {
+      totalSuccess,
+      savedMoney,
+      recentLogs: logsRes?.rows || [],
+    };
+  } catch (err) {
+    console.warn('[daily-vip-claim] 查询账本流水失败:', err);
+    return { totalSuccess: 0, savedMoney: 0, recentLogs: [] };
+  }
+};
+
+// ---- 实时用户状态缓存（通过 serverIntercept 或 Pinia 维护） ----
+
+const userVipState = {
+  userId: '',
+  tvipEndTime: null,
+  isVip: false,
+  lastUpdated: 0,
+};
+
+// 任务中心 Handle（支持在宿主任务中心查看状态与手动重试）
 // ---- 单飞锁：领取 + 升级共享同一 in-flight Promise，防止三处入口/自动任务并发重复请求 ----
 
 let claimInFlight = null;
 
-const claimOnce = (ctx) => {
+// 辅助发送主程序内部 API 请求（携带当前登录凭证）
+const sendInternalApiRequest = async (ctx, { method = 'POST', url, data = {}, params = {} }) => {
+  if (!ctx.electron?.api?.request) return null;
+  let token = '';
+  let userid = '';
+  try {
+    const kv = await ctx.electron.storage.getKv('pinia:user');
+    token = kv?.info?.token || '';
+    userid = kv?.info?.userid || '';
+  } catch {}
+  if (!token && ctx.pinia) {
+    try {
+      const store = ctx.pinia._s?.get('user');
+      token = store?.info?.token || '';
+      userid = store?.info?.userid || '';
+    } catch {}
+  }
+  const headers = {};
+  if (token) {
+    headers['Authorization'] = `token=${token}${userid ? `;userid=${userid}` : ''}`;
+    headers['Cookie'] = `token=${token}${userid ? `;userid=${userid}` : ''}`;
+  }
+  return await ctx.electron.api.request({
+    method,
+    url,
+    data,
+    params,
+    headers,
+  });
+};
+
+// 全能版任务：上报概念版广告打卡与听歌任务
+const runConceptEditionTasks = async (ctx) => {
+  let adSuccess = false;
+  let listenSuccess = false;
+
+  // 1. 概念版模拟广告打卡（获取 30s 广告奖励与成长值加成）
+  try {
+    const adRes = await sendInternalApiRequest(ctx, {
+      method: 'POST',
+      url: '/youth/vip',
+    });
+    if (adRes?.status === 200 || adRes?.body?.status === 1 || adRes?.body?.code === 0) {
+      adSuccess = true;
+    }
+  } catch (e) {
+    console.warn('[daily-vip-claim] 概念版广告打卡异常:', e);
+  }
+
+  // 2. 概念版听歌任务打卡上报
+  try {
+    const listenRes = await sendInternalApiRequest(ctx, {
+      method: 'POST',
+      url: '/youth/listen/song',
+      data: { mixsongid: 666075191 },
+    });
+    if (listenRes?.status === 200 || listenRes?.body?.status === 1 || listenRes?.body?.code === 0) {
+      listenSuccess = true;
+    }
+  } catch (e) {
+    console.warn('[daily-vip-claim] 概念版听歌打卡异常:', e);
+  }
+
+  return adSuccess || listenSuccess;
+};
+
+const claimOnce = (ctx, progressCallback) => {
   if (claimInFlight) return claimInFlight;
   claimInFlight = (async () => {
-    await ctx.kugou.user.claimDayVip(formatClaimDate());
+    const t0 = Date.now();
+    const today = formatClaimDate();
+    let upgradeSuccess = false;
+    let conceptTaskSuccess = false;
+    let claimError = null;
+
+    progressCallback?.('正在领取基础畅听会员...');
+    try {
+      await ctx.kugou.user.claimDayVip(today);
+    } catch (err) {
+      claimError = err;
+      const errCode = Number(err?.response?.body?.error_code || err?.response?.body?.errcode);
+      if (
+        (errCode === 10008 || errCode === 10009 || errCode === 10010 || errCode === 20028) &&
+        ctx.kugouVerification &&
+        typeof ctx.kugouVerification.requestVerification === 'function'
+      ) {
+        try {
+          ctx.toast?.info?.('检测到安全验证，正在调起验证...');
+          await ctx.kugouVerification.requestVerification({
+            scene: 'claim_vip',
+            message: '领取每日畅听会员需进行安全验证',
+          });
+          await ctx.kugou.user.claimDayVip(today);
+          claimError = null;
+        } catch (verifyErr) {
+          console.warn('[daily-vip-claim] 验证码验证失败:', verifyErr);
+        }
+      }
+      if (claimError && !isClaim131001(claimError)) {
+        const durationMs = Date.now() - t0;
+        await recordClaimLedger({
+          userId: userVipState.userId,
+          claimDate: today,
+          claimedAt: Date.now(),
+          durationMs,
+          status: 'failed',
+          message: getApiErrorMessage(claimError, '领取失败'),
+        });
+        throw claimError;
+      }
+    }
+
+    progressCallback?.('正在升级概念特权...');
     try {
       await ctx.kugou.user.upgradeDayVip();
+      upgradeSuccess = true;
     } catch (upgradeError) {
       console.warn('[daily-vip-claim] 升级失败（非阻断）:', upgradeError);
     }
+
+    progressCallback?.('正在同步概念版听歌打卡...');
+    try {
+      conceptTaskSuccess = await runConceptEditionTasks(ctx);
+    } catch (conceptError) {
+      console.warn('[daily-vip-claim] 概念打卡异常（非阻断）:', conceptError);
+    }
+
+    const durationMs = Date.now() - t0;
+    const isAlreadyClaimed = Boolean(claimError && isClaim131001(claimError));
+    const expiryText = formatExpiryText(readTvipEndTime(ctx));
+
+    const messageParts = [];
+    if (isAlreadyClaimed) {
+      messageParts.push('今日已领畅听VIP');
+    } else {
+      messageParts.push(upgradeSuccess ? '畅听VIP领取并升级特权成功' : '畅听VIP领取成功');
+    }
+    if (conceptTaskSuccess) {
+      messageParts.push('概念版任务已打卡');
+    }
+
+    await recordClaimLedger({
+      userId: userVipState.userId,
+      claimDate: today,
+      claimedAt: Date.now(),
+      expiryText,
+      upgradeStatus: upgradeSuccess ? 1 : 0,
+      conceptTaskStatus: conceptTaskSuccess ? 1 : 0,
+      durationMs,
+      status: 'success',
+      message: messageParts.join('，'),
+    });
+
+    return {
+      today,
+      isAlreadyClaimed,
+      upgradeSuccess,
+      conceptTaskSuccess,
+      durationMs,
+    };
   })().finally(() => {
     claimInFlight = null;
   });
@@ -87,6 +359,28 @@ const getMonthRecordsCached = async (ctx) => {
 const isTodayClaimed = (records) => {
   const today = formatClaimDate();
   return (records ?? []).some((r) => r && r.date === today);
+};
+
+// 计算连续打卡天数（从今天或昨天往前推）
+const calculateStreakDays = (records) => {
+  if (!Array.isArray(records) || records.length === 0) return 0;
+  const dates = new Set(records.map((r) => r && r.date).filter(Boolean));
+  let streak = 0;
+  const check = new Date();
+  const todayStr = formatClaimDate(check);
+  if (!dates.has(todayStr)) {
+    check.setDate(check.getDate() - 1);
+  }
+  while (true) {
+    const dStr = formatClaimDate(check);
+    if (dates.has(dStr)) {
+      streak += 1;
+      check.setDate(check.getDate() - 1);
+    } else {
+      break;
+    }
+  }
+  return streak;
 };
 
 // 防御式解析当月领取记录（响应结构随酷狗上游可能变化）
@@ -194,6 +488,116 @@ const iconSvg = (h, iconData, { size = 18, className = '' } = {}) =>
     innerHTML: iconData?.body ?? '',
   });
 
+// ---- 任务中心调度管理（生命周期守护器：支持 terminal 自动销毁后的新世代注册） ----
+
+let taskHandle = null;
+
+const ensureTaskRun = (ctx, status = 'running', patch = {}) => {
+  if (taskHandle && taskHandle.active) {
+    try {
+      taskHandle.update({ status, ...patch });
+      return taskHandle;
+    } catch {}
+  }
+  if (!ctx.tasks || typeof ctx.tasks.register !== 'function') return null;
+  try {
+    taskHandle = ctx.tasks.register({
+      id: 'daily-vip-claim-task',
+      name: '每日畅听会员全套打卡',
+      icon: ctx.icons?.iconGift || {
+        width: 24,
+        height: 24,
+        body: '<path fill="currentColor" d="M20 12v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9H2V7a1 1 0 0 1 1-1h4.17a3 3 0 0 1 5.66-1.41A3 3 0 0 1 16.83 6H21a1 1 0 0 1 1 1v5h-2zm-2 2H6v6h12v-6zm2-6H4v2h16V8z"/>',
+      },
+      status,
+      retention: {
+        completed: { mode: 'auto', delayMs: 15000 },
+        error: { mode: 'manual' },
+        aborted: { mode: 'auto', delayMs: 5000 },
+      },
+      progress: patch.progress || { label: '准备就绪' },
+      actions: [
+        {
+          id: 'claim_now',
+          label: '立即打卡',
+          variant: 'primary',
+          onClick: () => {
+            void maybeAutoClaim(ctx, true);
+          },
+        },
+        {
+          id: 'view_ledger',
+          label: '查看账本',
+          variant: 'ghost',
+          closePanel: true,
+          onClick: () => {
+            void ledgerModalState.open?.();
+          },
+        },
+      ],
+      ...patch,
+    });
+  } catch (err) {
+    console.warn('[daily-vip-claim] 注册任务中心失败:', err);
+  }
+  return taskHandle;
+};
+
+// ---- 标题栏动态天数胶囊管理 ----
+
+let unregisterTitlebar = null;
+
+const updateTitlebarBadge = async (ctx) => {
+  if (!ctx.ui?.titlebar || typeof ctx.ui.titlebar.register !== 'function') return;
+  try {
+    const ok = await isLoggedInCached(ctx);
+    let title = '畅听VIP';
+    let tooltip = '畅听VIP · 每日自动续期与到期流水 (点击查看账本)';
+
+    if (ok === false) {
+      title = '畅听VIP · 未登录';
+      tooltip = '未登录酷狗账号，点击打开流水账本或去登录';
+    } else {
+      const endTime = readTvipEndTime(ctx);
+      const expiryText = formatExpiryText(endTime);
+      const [records, ledger] = await Promise.all([
+        getMonthRecordsCached(ctx).catch(() => []),
+        getLedgerStats(userVipState.userId),
+      ]);
+      const streak = calculateStreakDays(records);
+      const claimedToday = isTodayClaimed(records);
+      const totalDays = ledger.totalSuccess || 0;
+      const saved = ledger.savedMoney || 0;
+
+      if (expiryText === '已过期') {
+        title = '畅听VIP · 已过期';
+      } else if (expiryText !== '--') {
+        title = claimedToday ? `✓ 畅听VIP · ${expiryText}` : `畅听VIP · ${expiryText}`;
+      }
+
+      tooltip = `畅听VIP · 到期: ${expiryText} · 连续打卡: ${streak}天 · 累计打卡: ${totalDays}天 (省¥${saved}) · 点击查看账本`;
+    }
+
+    unregisterTitlebar = ctx.ui.titlebar.register({
+      id: 'daily-vip-badge',
+      title,
+      icon: ctx.icons?.iconGift || {
+        width: 24,
+        height: 24,
+        body: '<path fill="currentColor" d="M20 12v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9H2V7a1 1 0 0 1 1-1h4.17a3 3 0 0 1 5.66-1.41A3 3 0 0 1 16.83 6H21a1 1 0 0 1 1 1v5h-2zm-2 2H6v6h12v-6zm2-6H4v2h16V8z"/>',
+      },
+      tooltip,
+      defaultPlacement: 'toolbar',
+      order: 25,
+      onClick: () => {
+        void ledgerModalState.open?.();
+      },
+    });
+  } catch (err) {
+    console.warn('[daily-vip-claim] 刷新标题栏徽章异常:', err);
+  }
+};
+
 // ---- 领取卡片共享状态/动作 ----
 // onAfterClaim：领取成功后回调（卡片用它刷新到期/统计状态）
 const createClaimState = (ctx, onAfterClaim) => {
@@ -237,18 +641,26 @@ const createClaimState = (ctx, onAfterClaim) => {
       return;
     }
     isClaiming.value = true;
+    const runTask = ensureTaskRun(ctx, 'running', { progress: { label: '正在执行打卡...' } });
     try {
-      await claimOnce(ctx);
-      ctx.toast.show('已领取 1 天畅听会员', 'success', 4000, {
+      await claimOnce(ctx, (stepLabel) => {
+        runTask?.update?.({ progress: { label: stepLabel } });
+      });
+      ctx.toast.show('已成功领取 1 天畅听会员并完成打卡', 'success', 4000, {
         label: '查看记录',
         handler: () => loadRecords(),
       });
       refreshUserInfoBestEffort(ctx);
+      runTask?.finish?.('completed', { progress: { label: '今日全套VIP续期与打卡已完成' } });
+      void updateTitlebarBadge(ctx);
       if (onAfterClaim) onAfterClaim();
       if (showRecords.value) await loadRecords();
     } catch (error) {
       console.warn('[daily-vip-claim] 领取失败:', error);
-      ctx.toast.danger(getApiErrorMessage(error, '领取每日畅听会员失败'));
+      const errMsg = getApiErrorMessage(error, '领取每日畅听会员失败');
+      ctx.toast.danger(errMsg);
+      runTask?.finish?.('error', { error: errMsg });
+      void updateTitlebarBadge(ctx);
     } finally {
       isClaiming.value = false;
     }
@@ -265,37 +677,57 @@ const createClaimState = (ctx, onAfterClaim) => {
   };
 };
 
-// ---- 自动领取（幂等）：启动 5s / 系统唤醒 / 每小时 各检查一次 ----
-const maybeAutoClaim = async (ctx) => {
+// ---- 自动打卡（幂等）：启动 5s / 系统唤醒 / 每小时 各检查一次 ----
+const maybeAutoClaim = async (ctx, manual = false) => {
   const ok = await isLoggedInCached(ctx);
   if (ok === false) {
-    console.info('[daily-vip-claim] 自动领取跳过：未登录');
+    console.info('[daily-vip-claim] 自动打卡跳过：未登录');
+    const task = ensureTaskRun(ctx, 'aborted', { progress: { label: '未登录，跳过自动打卡' } });
+    task?.finish?.('aborted', { progress: { label: '未登录，跳过自动打卡' } });
+    void updateTitlebarBadge(ctx);
+    if (manual) ctx.toast?.info?.('请先登录后再进行打卡');
     return;
   }
-  // 预判今日已领：命中则静默跳过，不打领取请求
-  try {
-    const records = await getMonthRecordsCached(ctx);
-    if (isTodayClaimed(records)) {
-      console.info('[daily-vip-claim] 自动领取跳过：今日已领取');
-      return;
+  // 预判今日已领（非手动强制执行时）
+  if (!manual) {
+    try {
+      const records = await getMonthRecordsCached(ctx);
+      if (isTodayClaimed(records)) {
+        console.info('[daily-vip-claim] 自动打卡跳过：今日已领取');
+        const task = ensureTaskRun(ctx, 'completed', { progress: { label: '今日已完成打卡，明天再来' } });
+        task?.finish?.('completed', { progress: { label: '今日已完成打卡，明天再来' } });
+        void updateTitlebarBadge(ctx);
+        return;
+      }
+    } catch (error) {
+      console.warn('[daily-vip-claim] 预检领取记录失败，尝试直接打卡:', error);
     }
-  } catch (error) {
-    console.warn('[daily-vip-claim] 预检领取记录失败，尝试直接领取:', error);
   }
+  const runTask = ensureTaskRun(ctx, 'running', { progress: { label: '正在执行每日打卡...' } });
   for (let attempt = 0; attempt <= 1; attempt += 1) {
     try {
-      await claimOnce(ctx);
-      ctx.toast.success('已自动领取 1 天畅听会员');
+      await claimOnce(ctx, (stepLabel) => {
+        runTask?.update?.({ progress: { label: stepLabel } });
+      });
+      ctx.toast.success('已成功完成每日畅听VIP与任务打卡！');
       refreshUserInfoBestEffort(ctx);
+      runTask?.finish?.('completed', { progress: { label: '今日全套VIP续期与打卡已完成' } });
+      void updateTitlebarBadge(ctx);
       return;
     } catch (error) {
       if (isClaim131001(error)) {
-        console.info('[daily-vip-claim] 自动领取跳过：今日已领取');
+        console.info('[daily-vip-claim] 自动打卡提示：今日已领取');
+        runTask?.finish?.('completed', { progress: { label: '今日已领取，明天再来' } });
+        void updateTitlebarBadge(ctx);
+        if (manual) ctx.toast?.info?.('今日已领取，明天再来');
         return;
       }
-      if (attempt === 1) {
-        console.warn('[daily-vip-claim] 自动领取失败:', error);
-        ctx.toast.danger(getApiErrorMessage(error, '自动领取每日畅听会员失败'));
+      if (attempt === 1 || manual) {
+        console.warn('[daily-vip-claim] 打卡失败:', error);
+        const errMsg = getApiErrorMessage(error, '每日畅听VIP打卡失败');
+        ctx.toast.danger(errMsg);
+        runTask?.finish?.('error', { error: errMsg });
+        void updateTitlebarBadge(ctx);
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -479,6 +911,184 @@ const CSS = `
   opacity: 0.6;
 }
 
+.dvp-modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(8px);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.dvp-modal {
+  width: 500px;
+  max-width: 92vw;
+  max-height: 85vh;
+  background: var(--color-bg-container, #1e1e24);
+  border: 1px solid var(--color-border, rgba(255, 255, 255, 0.1));
+  border-radius: 16px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--color-text-main, #f8fafc);
+  animation: dvp-modal-in 0.2s ease-out;
+}
+@keyframes dvp-modal-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+.dvp-modal-header {
+  padding: 16px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+}
+.dvp-modal-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--color-text-main, #f8fafc);
+}
+.dvp-modal-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--color-text-secondary, #94a3b8);
+  font-size: 16px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  transition: all 0.15s;
+}
+.dvp-modal-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+.dvp-modal-body {
+  padding: 20px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.dvp-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.dvp-stat-card {
+  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.08));
+  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.14));
+  border-radius: 12px;
+  padding: 12px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+.dvp-stat-label {
+  font-size: 11px;
+  color: var(--color-text-secondary, #94a3b8);
+  font-weight: 600;
+}
+.dvp-stat-value {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--color-primary, #31cfa1);
+  margin-top: 4px;
+}
+.dvp-status-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.05));
+  font-size: 12px;
+  color: var(--color-text-main, #f8fafc);
+}
+.dvp-ledger-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--color-text-secondary, #94a3b8);
+}
+.dvp-ledger-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.dvp-ledger-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.06));
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.1));
+}
+.dvp-ledger-item-left {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.dvp-ledger-date {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-main, #f8fafc);
+}
+.dvp-ledger-time {
+  font-size: 11px;
+  color: var(--color-text-secondary, #94a3b8);
+}
+.dvp-ledger-item-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dvp-badge-success {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-primary, #31cfa1) 18%, transparent);
+  color: var(--color-primary, #31cfa1);
+}
+.dvp-badge-failed {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.18);
+  color: #ef4444;
+}
+.dvp-badge-concept {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: rgba(59, 130, 246, 0.18);
+  color: #3b82f6;
+}
+.dvp-modal-footer {
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  border-top: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+}
+
 .dvp-logged-out {
   display: flex;
   flex-direction: column;
@@ -546,6 +1156,183 @@ const CSS = `
 
 // ---- 共享组件 ----
 
+// ---- 全局账本弹窗控制器 ----
+const ledgerModalState = {
+  open: null,
+  close: null,
+};
+
+const createLedgerModal = (ctx, Button) => {
+  const { h, defineComponent, ref } = ctx.vue;
+
+  return defineComponent({
+    name: 'daily-vip-ledger-modal',
+    setup() {
+      const visible = ref(false);
+      const loading = ref(false);
+      const stats = ref({ totalSuccess: 0, savedMoney: 0, recentLogs: [] });
+      const streakDays = ref(0);
+      const vipExpiry = ref('--');
+
+      const refresh = async () => {
+        loading.value = true;
+        try {
+          vipExpiry.value = formatExpiryText(readTvipEndTime(ctx));
+          const [s, recs] = await Promise.all([
+            getLedgerStats(userVipState.userId),
+            getMonthRecordsCached(ctx),
+          ]);
+          stats.value = s;
+          streakDays.value = calculateStreakDays(recs);
+        } catch (err) {
+          console.warn('[daily-vip-claim] 刷新账本失败:', err);
+        } finally {
+          loading.value = false;
+        }
+      };
+
+      ledgerModalState.open = async () => {
+        visible.value = true;
+        await refresh();
+      };
+      ledgerModalState.close = () => {
+        visible.value = false;
+      };
+
+      const handleClaimFromModal = async () => {
+        loading.value = true;
+        try {
+          await maybeAutoClaim(ctx, true);
+          refreshUserInfoBestEffort(ctx);
+          await refresh();
+        } catch (err) {
+          ctx.toast.danger(getApiErrorMessage(err, '打卡失败'));
+        } finally {
+          loading.value = false;
+        }
+      };
+
+      return () => {
+        if (!visible.value) return null;
+        return h('div', { class: 'dvp-modal-mask', onClick: () => { visible.value = false; } }, [
+          h(
+            'div',
+            { class: 'dvp-modal', onClick: (e) => e.stopPropagation() },
+            [
+              // Header
+              h('div', { class: 'dvp-modal-header' }, [
+                h('div', { class: 'dvp-modal-title' }, [
+                  iconSvg(h, ctx.icons.iconGift, { size: 18 }),
+                  h('span', null, '畅听VIP 打卡流水账本'),
+                ]),
+                h(
+                  'button',
+                  { class: 'dvp-modal-close', onClick: () => { visible.value = false; } },
+                  '✕',
+                ),
+              ]),
+              // Body
+              h('div', { class: 'dvp-modal-body' }, [
+                // 3 个统计大卡片
+                h('div', { class: 'dvp-stats-grid' }, [
+                  h('div', { class: 'dvp-stat-card' }, [
+                    h('span', { class: 'dvp-stat-label' }, '累计领取'),
+                    h('span', { class: 'dvp-stat-value' }, `${stats.value.totalSuccess} 天`),
+                  ]),
+                  h('div', { class: 'dvp-stat-card' }, [
+                    h('span', { class: 'dvp-stat-label' }, '连续打卡'),
+                    h('span', { class: 'dvp-stat-value' }, `${streakDays.value} 天`),
+                  ]),
+                  h('div', { class: 'dvp-stat-card' }, [
+                    h('span', { class: 'dvp-stat-label' }, '累计节省约'),
+                    h('span', { class: 'dvp-stat-value', style: 'color: #f59e0b' }, `¥${stats.value.savedMoney}`),
+                  ]),
+                ]),
+                // 状态条
+                h('div', { class: 'dvp-status-strip' }, [
+                  h('span', null, `会员状态：畅听到期 ${vipExpiry.value}`),
+                  h('span', { class: 'dvp-muted' }, `用户: ${userVipState.userId || '当前账号'}`),
+                ]),
+                // 最近流水标题
+                h('div', { class: 'dvp-ledger-title' }, [
+                  h('span', null, '打卡明细流水 (SQLite 本地账本)'),
+                  h(
+                    'button',
+                    {
+                      class: 'dvp-toggle',
+                      disabled: loading.value,
+                      onClick: refresh,
+                    },
+                    [
+                      iconSvg(h, ctx.icons.iconRefreshCw, {
+                        size: 11,
+                        className: loading.value ? 'dvp-spin' : '',
+                      }),
+                      '刷新',
+                    ],
+                  ),
+                ]),
+                // 流水明细列表
+                h('div', { class: 'dvp-ledger-list' }, [
+                  stats.value.recentLogs.length === 0
+                    ? h('div', { class: 'dvp-records-empty' }, '暂无打卡流水记录，点击立即续期开始记账')
+                    : stats.value.recentLogs.map((log) =>
+                        h('div', { class: 'dvp-ledger-item', key: log.id || log.claimed_at }, [
+                          h('div', { class: 'dvp-ledger-item-left' }, [
+                            h('div', { class: 'dvp-ledger-date' }, log.claim_date || ''),
+                            h(
+                              'div',
+                              { class: 'dvp-ledger-time' },
+                              `${new Date(Number(log.claimed_at)).toLocaleTimeString('zh-CN', { hour12: false })} · ${log.message || '已领取'}`,
+                            ),
+                          ]),
+                          h('div', { class: 'dvp-ledger-item-right' }, [
+                            log.duration_ms ? h('span', { class: 'dvp-muted' }, `${log.duration_ms}ms`) : null,
+                            log.concept_task_status
+                              ? h('span', { class: 'dvp-badge-concept' }, '概念已打卡')
+                              : null,
+                            h(
+                              'span',
+                              {
+                                class: log.status === 'success' ? 'dvp-badge-success' : 'dvp-badge-failed',
+                              },
+                              log.upgrade_status ? '已升级' : (log.status === 'success' ? '已领取' : '失败'),
+                            ),
+                          ]),
+                        ]),
+                      ),
+                ]),
+              ]),
+              // Footer
+              h('div', { class: 'dvp-modal-footer' }, [
+                h(
+                  Button,
+                  {
+                    variant: 'ghost',
+                    size: 'small',
+                    onClick: () => { visible.value = false; },
+                  },
+                  { default: () => '关闭' },
+                ),
+                h(
+                  Button,
+                  {
+                    variant: 'primary',
+                    size: 'small',
+                    disabled: loading.value,
+                    onClick: handleClaimFromModal,
+                  },
+                  { default: () => (loading.value ? '处理中...' : '立即全套打卡') },
+                ),
+              ]),
+            ],
+          ),
+        ]);
+      };
+    },
+  });
+};
+
 // 领取卡片（variant: 'card' 独立卡片样式 | 'inline' 贴会员状态卡样式）
 // 不依赖宿主全局 Icon（自建迷你 app 中不可解析），统一用内联 SVG。
 const createClaimCard = (ctx, Button) => {
@@ -598,13 +1385,20 @@ const createClaimCard = (ctx, Button) => {
       const vipExpiry = ref('--');
       const monthCount = ref(null);
       const claimedToday = ref(false);
+      const streakDays = ref(0);
+      const savedMoney = ref(0);
 
       const refreshStatus = async () => {
         vipExpiry.value = formatExpiryText(readTvipEndTime(ctx));
         try {
-          const records = await getMonthRecordsCached(ctx);
+          const [records, ledger] = await Promise.all([
+            getMonthRecordsCached(ctx),
+            getLedgerStats(userVipState.userId),
+          ]);
           monthCount.value = records.length;
           claimedToday.value = isTodayClaimed(records);
+          streakDays.value = calculateStreakDays(records);
+          savedMoney.value = ledger.savedMoney || 0;
         } catch (error) {
           console.warn('[daily-vip-claim] 读取领取统计失败:', error);
           monthCount.value = null;
@@ -624,6 +1418,8 @@ const createClaimCard = (ctx, Button) => {
       const statusParts = () => {
         const parts = [`畅听到期 ${vipExpiry.value}`];
         if (monthCount.value != null) parts.push(`本月已领 ${monthCount.value} 天`);
+        if (streakDays.value > 0) parts.push(`连续打卡 ${streakDays.value} 天`);
+        if (savedMoney.value > 0) parts.push(`累计省约 ¥${savedMoney.value}`);
         if (claimedToday.value) parts.push('今日已领取');
         return parts.join(' · ');
       };
@@ -659,16 +1455,27 @@ const createClaimCard = (ctx, Button) => {
                     },
                     { default: () => '去登录' },
                   )
-                : h(
-                    Button,
-                    {
-                      variant: 'outline',
-                      size: 'xs',
-                      loading: state.isClaiming.value,
-                      onClick: state.handleClaim,
-                    },
-                    { default: () => (state.isClaiming.value ? '领取中' : '领取') },
-                  ),
+                : h('div', { style: 'display: flex; gap: 6px; align-items: center;' }, [
+                    h(
+                      Button,
+                      {
+                        variant: 'ghost',
+                        size: 'xs',
+                        onClick: () => { void ledgerModalState.open?.(); },
+                      },
+                      { default: () => '账本' },
+                    ),
+                    h(
+                      Button,
+                      {
+                        variant: 'outline',
+                        size: 'xs',
+                        loading: state.isClaiming.value,
+                        onClick: state.handleClaim,
+                      },
+                      { default: () => (state.isClaiming.value ? '领取中' : '领取 1 天') },
+                    ),
+                  ]),
             ]),
             loggedIn.value !== false ? h('div', { class: 'dvp-status' }, statusParts()) : null,
             ...renderRecords(state),
@@ -918,7 +1725,78 @@ export function activate(ctx) {
     component: SettingsPanel,
   });
 
-  // 4. 自动领取（启动 5s 后、系统唤醒、每小时各检查一次）
+  // 4. 任务中心注册（若宿主支持）
+  if (ctx.tasks && typeof ctx.tasks.register === 'function') {
+    ensureTaskRun(ctx, 'pending', { progress: { label: '就绪，等待下一次自动打卡' } });
+  }
+
+  // 5. 初始化 SQLite 本地流水账本与弹窗
+  void initLedgerDb(ctx);
+  const LedgerModal = createLedgerModal(ctx, Button);
+  let unmountModal = null;
+  if (ctx.ui && typeof ctx.ui.teleport === 'function') {
+    try {
+      unmountModal = ctx.ui.teleport(LedgerModal);
+    } catch (teleportErr) {
+      console.warn('[daily-vip-claim] 挂载账本弹窗失败:', teleportErr);
+    }
+  }
+
+  // 6. 标题栏常驻会员直达胶囊（动态天数显示）
+  void updateTitlebarBadge(ctx);
+
+  // 7. 服务请求拦截：无缝感知用户 VIP 与登录态更新
+  let unintercept = null;
+  if (
+    ctx.server &&
+    typeof ctx.server.intercept === 'function' &&
+    ctx.descriptor?.manifest?.capabilities?.serverIntercept
+  ) {
+    try {
+      unintercept = ctx.server.intercept(
+        async (request, next) => {
+          const res = await next();
+          try {
+            const url = String(request?.url || '');
+            if (
+              url.includes('/user/vip') ||
+              url.includes('/user/detail') ||
+              url.includes('/user/profile') ||
+              url.includes('/youth')
+            ) {
+              monthRecordCache.at = 0; // 失效当月记录缓存
+              const body = res?.body;
+              const data = body?.data || body;
+              if (data && typeof data === 'object') {
+                if (data.userid || data.userId) {
+                  userVipState.userId = String(data.userid || data.userId);
+                }
+                const vipData = data.vip || (data.extendsInfo && data.extendsInfo.vip);
+                if (vipData && Array.isArray(vipData.busi_vip)) {
+                  const tvip = vipData.busi_vip.find(
+                    (v) => v && v.product_type === 'tvip' && v.is_vip === 1,
+                  );
+                  if (tvip && tvip.vip_end_time) {
+                    userVipState.tvipEndTime = tvip.vip_end_time;
+                    userVipState.isVip = true;
+                  }
+                }
+              }
+              void updateTitlebarBadge(ctx);
+            }
+          } catch (e) {
+            console.warn('[daily-vip-claim] 拦截器状态解析异常:', e);
+          }
+          return res;
+        },
+        { priority: 10, name: 'daily-vip-sync' },
+      );
+    } catch (interceptErr) {
+      console.warn('[daily-vip-claim] 注册请求拦截器失败:', interceptErr);
+    }
+  }
+
+  // 8. 自动领取（启动 5s 后、系统唤醒、每小时各检查一次）
   let disposed = false;
   let autoTimer = null;
   let autoInterval = null;
@@ -951,6 +1829,30 @@ export function activate(ctx) {
   disposeAll = () => {
     if (disposed) return;
     disposed = true;
+    if (unregisterTitlebar) {
+      try {
+        unregisterTitlebar();
+      } catch {}
+      unregisterTitlebar = null;
+    }
+    if (unmountModal) {
+      try {
+        unmountModal();
+      } catch {}
+      unmountModal = null;
+    }
+    if (unintercept) {
+      try {
+        unintercept();
+      } catch {}
+      unintercept = null;
+    }
+    if (taskHandle) {
+      try {
+        taskHandle.dismiss();
+      } catch {}
+      taskHandle = null;
+    }
     if (autoTimer) {
       clearTimeout(autoTimer);
       autoTimer = null;

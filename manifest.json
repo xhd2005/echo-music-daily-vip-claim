@@ -1,11 +1,16 @@
 {
   "id": "daily-vip-claim",
   "name": "每日畅听会员领取",
-  "version": "1.2.0",
-  "description": "每日领取 1 天畅听会员：个人中心会员状态下方直达，实时到期/本月已领统计，启动/唤醒/每小时自动领取",
+  "version": "2.1.0",
+  "description": "每日领取 1 天畅听会员、特权升级与概念版打卡：官方任务中心调度、SQLite 本地打卡流水账本、服务请求零侵入状态感知、标题栏动态天数胶囊",
   "author": "xhd2005",
   "icon": "logo.png",
   "main": "index.js",
-  "capabilities": { "kugouApi": true },
+  "capabilities": {
+    "kugouApi": true,
+    "serverIntercept": true,
+    "sqlite": true,
+    "kugouVerification": true
+  },
   "requires": { "echoMusicVersion": ">=2.2.7-beta.9" }
 }
