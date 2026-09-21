@@ -4,7 +4,8 @@
   "plugins": [
     {
       "id": "daily-vip-claim",
-      "tags": ["vip", "会员", "畅听", "每日领取"]
+      "downloadUrl": "https://github.com/xhd2005/echo-music-daily-vip-claim/releases/latest/download/daily-vip-claim-v2.1.0.zip",
+      "tags": ["vip", "会员", "畅听", "每日领取", "打卡"]
     }
   ]
 }
