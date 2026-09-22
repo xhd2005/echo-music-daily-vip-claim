@@ -1,8 +1,8 @@
 {
   "id": "daily-vip-claim",
   "name": "每日畅听会员领取",
-  "version": "2.1.0",
-  "description": "每日领取 1 天畅听会员、特权升级与概念版打卡：官方任务中心调度、SQLite 本地打卡流水账本、服务请求零侵入状态感知、标题栏动态天数胶囊",
+  "version": "2.1.1",
+  "description": "每日领取 1 天畅听会员、特权升级与概念版打卡：任务中心动态调度、SQLite 本地打卡流水账本(冷启动历史同步与现代视觉重构)、标题栏动态天数胶囊",
   "author": "xhd2005",
   "icon": "logo.png",
   "main": "index.js",

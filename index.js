@@ -52,6 +52,27 @@ const isClaim131001 = (error) =>
 
 // ---- SQLite 本地打卡流水账本 ----
 
+const userVipState = {
+  userId: '',
+  tvipEndTime: null,
+  isVip: false,
+  lastUpdated: 0,
+};
+
+const readUserId = (ctx) => {
+  try {
+    const store = ctx.pinia && ctx.pinia._s && ctx.pinia._s.get('user');
+    const id = store?.info?.userid || store?.info?.userId || store?.userid || store?.userId;
+    if (id) {
+      userVipState.userId = String(id);
+      return String(id);
+    }
+  } catch {}
+  return userVipState.userId || '';
+};
+
+// ---- SQLite 本地打卡流水账本 ----
+
 const LEDGER_DB_NAME = 'vip_claim_ledger';
 let ledgerDb = null;
 
@@ -83,19 +104,62 @@ const initLedgerDb = async (ctx) => {
         {
           version: 2,
           sql: [
-            `ALTER TABLE claim_ledger ADD COLUMN concept_task_status INTEGER NOT NULL DEFAULT 0;`,
+            `SELECT 1;`,
           ],
         },
       ],
     });
-    if (res.ok) {
+    if (res && res.ok) {
       ledgerDb = res;
+      console.info('[daily-vip-claim] SQLite 本地账本加载就绪');
+      // 冷启动历史记录同步：若账本为空，自动从当月已领记录回填
+      void backfillLedgerFromMonthRecords(ctx, readUserId(ctx));
       return ledgerDb;
+    } else {
+      console.warn('[daily-vip-claim] 打开 SQLite 本地账本未成功:', res?.error);
     }
   } catch (err) {
     console.warn('[daily-vip-claim] 打开 SQLite 本地账本异常:', err);
   }
   return null;
+};
+
+// 冷启动历史记录自动回填（若本地账本为空，从酷狗当月已打卡接口同步）
+const backfillLedgerFromMonthRecords = async (ctx, userId = '') => {
+  if (!ledgerDb) return;
+  try {
+    const countRes = await ledgerDb.get('SELECT COUNT(*) AS total FROM claim_ledger');
+    const existingCount = Number(countRes?.row?.total || 0);
+    if (existingCount > 0) return;
+
+    const records = await getMonthRecordsCached(ctx).catch(() => []);
+    if (!Array.isArray(records) || records.length === 0) return;
+
+    const uid = String(userId || readUserId(ctx) || '');
+    for (const rec of records) {
+      if (!rec || !rec.date) continue;
+      const claimedAt = new Date(`${rec.date} 12:00:00`).getTime() || Date.now();
+      await ledgerDb.run(
+        `INSERT OR IGNORE INTO claim_ledger
+          (user_id, claim_date, claimed_at, expiry_text, upgrade_status, concept_task_status, duration_ms, status, message)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          uid,
+          rec.date,
+          claimedAt,
+          '',
+          1,
+          0,
+          80,
+          'success',
+          rec.label || '当月已领记录',
+        ],
+      );
+    }
+    console.info(`[daily-vip-claim] 已自动同步 ${records.length} 条当月打卡历史到本地账本`);
+  } catch (err) {
+    console.warn('[daily-vip-claim] 自动同步当月历史打卡记录异常:', err);
+  }
 };
 
 const recordClaimLedger = async ({
@@ -135,20 +199,21 @@ const recordClaimLedger = async ({
 const getLedgerStats = async (userId = '') => {
   if (!ledgerDb) return { totalSuccess: 0, savedMoney: 0, recentLogs: [] };
   try {
+    const uid = String(userId || '').trim();
+    const whereClause = uid ? 'WHERE (user_id = ? OR user_id = "")' : '';
+    const params = uid ? [uid] : [];
     const totalRes = await ledgerDb.get(
-      `SELECT COUNT(*) AS total FROM claim_ledger WHERE status = 'success' ${
-        userId ? 'AND (user_id = ? OR user_id = "")' : ''
+      `SELECT COUNT(*) AS total FROM claim_ledger ${
+        uid ? 'WHERE status = "success" AND (user_id = ? OR user_id = "")' : 'WHERE status = "success"'
       }`,
-      userId ? [String(userId)] : [],
+      params,
     );
     const totalSuccess = Number(totalRes?.row?.total || 0);
     // 酷狗畅听 VIP 市价折合约 0.5 元/天
     const savedMoney = Math.round(totalSuccess * 0.5 * 10) / 10;
     const logsRes = await ledgerDb.all(
-      `SELECT * FROM claim_ledger ${
-        userId ? 'WHERE user_id = ? OR user_id = ""' : ''
-      } ORDER BY claimed_at DESC LIMIT 30`,
-      userId ? [String(userId)] : [],
+      `SELECT * FROM claim_ledger ${whereClause} ORDER BY claimed_at DESC LIMIT 50`,
+      params,
     );
     return {
       totalSuccess,
@@ -159,15 +224,6 @@ const getLedgerStats = async (userId = '') => {
     console.warn('[daily-vip-claim] 查询账本流水失败:', err);
     return { totalSuccess: 0, savedMoney: 0, recentLogs: [] };
   }
-};
-
-// ---- 实时用户状态缓存（通过 serverIntercept 或 Pinia 维护） ----
-
-const userVipState = {
-  userId: '',
-  tvipEndTime: null,
-  isVip: false,
-  lastUpdated: 0,
 };
 
 // 任务中心 Handle（支持在宿主任务中心查看状态与手动重试）
@@ -438,11 +494,12 @@ const readTvipEndTime = (ctx) => {
 const formatExpiryText = (value) => {
   if (!value) return '--';
   try {
-    const end = new Date(value);
+    const time = typeof value === 'number' && value < 1e11 ? value * 1000 : Number(value) || value;
+    const end = new Date(time);
     if (Number.isNaN(end.getTime())) return '--';
     const diffDays = Math.ceil((end.getTime() - Date.now()) / 86400000);
     if (diffDays <= 0) return '已过期';
-    return `${diffDays}天后到期`;
+    return `剩余 ${diffDays} 天`;
   } catch {
     return '--';
   }
@@ -488,18 +545,18 @@ const iconSvg = (h, iconData, { size = 18, className = '' } = {}) =>
     innerHTML: iconData?.body ?? '',
   });
 
-// ---- 任务中心调度管理（生命周期守护器：支持 terminal 自动销毁后的新世代注册） ----
+// ---- 任务中心调度管理（生命周期守护器：动态创建、快速自动销毁、避免常驻残留） ----
 
 let taskHandle = null;
 
-const ensureTaskRun = (ctx, status = 'running', patch = {}) => {
-  if (taskHandle && taskHandle.active) {
-    try {
-      taskHandle.update({ status, ...patch });
-      return taskHandle;
-    } catch {}
-  }
+const startClaimTask = (ctx, patch = {}) => {
   if (!ctx.tasks || typeof ctx.tasks.register !== 'function') return null;
+  if (taskHandle) {
+    try {
+      taskHandle.dismiss();
+    } catch {}
+    taskHandle = null;
+  }
   try {
     taskHandle = ctx.tasks.register({
       id: 'daily-vip-claim-task',
@@ -509,29 +566,22 @@ const ensureTaskRun = (ctx, status = 'running', patch = {}) => {
         height: 24,
         body: '<path fill="currentColor" d="M20 12v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9H2V7a1 1 0 0 1 1-1h4.17a3 3 0 0 1 5.66-1.41A3 3 0 0 1 16.83 6H21a1 1 0 0 1 1 1v5h-2zm-2 2H6v6h12v-6zm2-6H4v2h16V8z"/>',
       },
-      status,
+      status: 'running',
       retention: {
-        completed: { mode: 'auto', delayMs: 15000 },
-        error: { mode: 'manual' },
-        aborted: { mode: 'auto', delayMs: 5000 },
+        completed: { mode: 'auto', delayMs: 3500 },
+        error: { mode: 'auto', delayMs: 5000 },
+        aborted: { mode: 'auto', delayMs: 3000 },
       },
-      progress: patch.progress || { label: '准备就绪' },
+      progress: patch.progress || { label: '正在执行打卡...' },
       actions: [
         {
-          id: 'claim_now',
-          label: '立即打卡',
-          variant: 'primary',
-          onClick: () => {
-            void maybeAutoClaim(ctx, true);
-          },
-        },
-        {
-          id: 'view_ledger',
-          label: '查看账本',
+          id: 'dismiss_now',
+          label: '完成',
           variant: 'ghost',
-          closePanel: true,
           onClick: () => {
-            void ledgerModalState.open?.();
+            try {
+              taskHandle?.dismiss();
+            } catch {}
           },
         },
       ],
@@ -682,8 +732,6 @@ const maybeAutoClaim = async (ctx, manual = false) => {
   const ok = await isLoggedInCached(ctx);
   if (ok === false) {
     console.info('[daily-vip-claim] 自动打卡跳过：未登录');
-    const task = ensureTaskRun(ctx, 'aborted', { progress: { label: '未登录，跳过自动打卡' } });
-    task?.finish?.('aborted', { progress: { label: '未登录，跳过自动打卡' } });
     void updateTitlebarBadge(ctx);
     if (manual) ctx.toast?.info?.('请先登录后再进行打卡');
     return;
@@ -694,8 +742,6 @@ const maybeAutoClaim = async (ctx, manual = false) => {
       const records = await getMonthRecordsCached(ctx);
       if (isTodayClaimed(records)) {
         console.info('[daily-vip-claim] 自动打卡跳过：今日已领取');
-        const task = ensureTaskRun(ctx, 'completed', { progress: { label: '今日已完成打卡，明天再来' } });
-        task?.finish?.('completed', { progress: { label: '今日已完成打卡，明天再来' } });
         void updateTitlebarBadge(ctx);
         return;
       }
@@ -703,7 +749,7 @@ const maybeAutoClaim = async (ctx, manual = false) => {
       console.warn('[daily-vip-claim] 预检领取记录失败，尝试直接打卡:', error);
     }
   }
-  const runTask = ensureTaskRun(ctx, 'running', { progress: { label: '正在执行每日打卡...' } });
+  const runTask = startClaimTask(ctx, { progress: { label: '正在执行每日全套打卡...' } });
   for (let attempt = 0; attempt <= 1; attempt += 1) {
     try {
       await claimOnce(ctx, (stepLabel) => {
@@ -914,8 +960,8 @@ const CSS = `
 .dvp-modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.65);
-  backdrop-filter: blur(8px);
+  background: rgba(0, 0, 0, 0.68);
+  backdrop-filter: blur(12px);
   z-index: 9999;
   display: flex;
   align-items: center;
@@ -923,54 +969,85 @@ const CSS = `
   padding: 20px;
 }
 .dvp-modal {
-  width: 500px;
-  max-width: 92vw;
-  max-height: 85vh;
-  background: var(--color-bg-container, #1e1e24);
-  border: 1px solid var(--color-border, rgba(255, 255, 255, 0.1));
-  border-radius: 16px;
-  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5);
+  width: 530px;
+  max-width: 94vw;
+  max-height: 88vh;
+  background: var(--color-bg-container, #16181d);
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
+  border-radius: 20px;
+  box-shadow: 0 24px 60px -8px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.05);
   display: flex;
   flex-direction: column;
   overflow: hidden;
   color: var(--color-text-main, #f8fafc);
-  animation: dvp-modal-in 0.2s ease-out;
+  animation: dvp-modal-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
 }
 @keyframes dvp-modal-in {
-  from { opacity: 0; transform: scale(0.96); }
-  to { opacity: 1; transform: scale(1); }
+  from { opacity: 0; transform: scale(0.95) translateY(8px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
 }
 .dvp-modal-header {
-  padding: 16px 20px;
+  padding: 18px 22px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.04));
 }
-.dvp-modal-title {
+.dvp-modal-title-box {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 15px;
-  font-weight: 700;
+  gap: 12px;
+}
+.dvp-modal-icon-wrap {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: color-mix(in srgb, #31cfa1 16%, transparent);
+  border: 1px solid color-mix(in srgb, #31cfa1 30%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #31cfa1;
+  box-shadow: 0 4px 14px color-mix(in srgb, #31cfa1 20%, transparent);
+}
+.dvp-modal-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.dvp-modal-title {
+  font-size: 16px;
+  font-weight: 850;
   color: var(--color-text-main, #f8fafc);
+  letter-spacing: -0.01em;
+}
+.dvp-modal-subtitle {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--color-text-secondary, rgba(148, 163, 184, 0.75));
 }
 .dvp-modal-close {
-  background: none;
-  border: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: var(--control-muted-bg, rgba(148, 163, 184, 0.08));
+  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.12));
   cursor: pointer;
   color: var(--color-text-secondary, #94a3b8);
-  font-size: 16px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  transition: all 0.18s ease;
 }
 .dvp-modal-close:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.12);
   color: #fff;
+  border-color: rgba(255, 255, 255, 0.2);
 }
 .dvp-modal-body {
-  padding: 20px;
+  padding: 20px 22px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -979,114 +1056,248 @@ const CSS = `
 .dvp-stats-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
+  gap: 12px;
 }
 .dvp-stat-card {
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.08));
   border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.14));
-  border-radius: 12px;
-  padding: 12px 10px;
+  border-radius: 14px;
+  padding: 14px 12px;
   display: flex;
   flex-direction: column;
   align-items: center;
   text-align: center;
+  gap: 4px;
+  position: relative;
+  overflow: hidden;
+  transition: transform 0.18s ease, border-color 0.18s ease;
 }
-.dvp-stat-label {
-  font-size: 11px;
-  color: var(--color-text-secondary, #94a3b8);
-  font-weight: 600;
+.dvp-stat-card:hover {
+  transform: translateY(-2px);
+}
+.dvp-stat-card.stat-claim {
+  background: linear-gradient(145deg, color-mix(in srgb, #31cfa1 10%, transparent) 0%, var(--color-bg-elevated, rgba(148, 163, 184, 0.04)) 100%);
+  border-color: color-mix(in srgb, #31cfa1 25%, transparent);
+}
+.dvp-stat-card.stat-streak {
+  background: linear-gradient(145deg, color-mix(in srgb, #f59e0b 10%, transparent) 0%, var(--color-bg-elevated, rgba(148, 163, 184, 0.04)) 100%);
+  border-color: color-mix(in srgb, #f59e0b 25%, transparent);
+}
+.dvp-stat-card.stat-save {
+  background: linear-gradient(145deg, color-mix(in srgb, #fbbf24 10%, transparent) 0%, var(--color-bg-elevated, rgba(148, 163, 184, 0.04)) 100%);
+  border-color: color-mix(in srgb, #fbbf24 25%, transparent);
+}
+.dvp-stat-top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--color-text-secondary, rgba(148, 163, 184, 0.85));
 }
 .dvp-stat-value {
-  font-size: 18px;
-  font-weight: 800;
-  color: var(--color-primary, #31cfa1);
-  margin-top: 4px;
+  font-size: 24px;
+  font-weight: 850;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+.stat-claim .dvp-stat-value { color: #31cfa1; }
+.stat-streak .dvp-stat-value { color: #f59e0b; }
+.stat-save .dvp-stat-value { color: #fbbf24; }
+.dvp-stat-sub {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--color-text-secondary, rgba(148, 163, 184, 0.65));
 }
 .dvp-status-strip {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.05));
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.06));
+  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.12));
   font-size: 12px;
+}
+.dvp-status-left {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 750;
   color: var(--color-text-main, #f8fafc);
+}
+.dvp-status-user {
+  font-size: 11px;
+  font-weight: 650;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--control-muted-bg, rgba(148, 163, 184, 0.1));
+  color: var(--color-text-secondary, rgba(148, 163, 184, 0.85));
 }
 .dvp-ledger-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 12px;
+  font-size: 12.5px;
+  font-weight: 800;
+  color: var(--color-text-main, #f8fafc);
+  margin-top: 2px;
+}
+.dvp-btn-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: var(--control-muted-bg, rgba(148, 163, 184, 0.08));
+  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.14));
+  color: var(--color-text-secondary, rgba(148, 163, 184, 0.85));
+  font-size: 11.5px;
   font-weight: 700;
-  color: var(--color-text-secondary, #94a3b8);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.dvp-btn-refresh:hover {
+  background: color-mix(in srgb, #31cfa1 12%, transparent);
+  border-color: color-mix(in srgb, #31cfa1 30%, transparent);
+  color: #31cfa1;
 }
 .dvp-ledger-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 220px;
+  max-height: 230px;
   overflow-y: auto;
   padding-right: 4px;
+}
+.dvp-ledger-list::-webkit-scrollbar {
+  width: 4px;
+}
+.dvp-ledger-list::-webkit-scrollbar-thumb {
+  background: var(--border-subtle, rgba(148, 163, 184, 0.2));
+  border-radius: 999px;
 }
 .dvp-ledger-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 9px 12px;
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.06));
-  border-radius: 8px;
+  padding: 10px 14px;
+  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.05));
+  border-radius: 11px;
   border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.1));
+  transition: background 0.12s ease;
+}
+.dvp-ledger-item:hover {
+  background: var(--control-hover-bg, rgba(148, 163, 184, 0.09));
 }
 .dvp-ledger-item-left {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
+  min-width: 0;
 }
 .dvp-ledger-date {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 12.5px;
+  font-weight: 750;
   color: var(--color-text-main, #f8fafc);
+  font-variant-numeric: tabular-nums;
 }
 .dvp-ledger-time {
   font-size: 11px;
-  color: var(--color-text-secondary, #94a3b8);
+  font-weight: 500;
+  color: var(--color-text-secondary, rgba(148, 163, 184, 0.75));
 }
 .dvp-ledger-item-right {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  flex-shrink: 0;
 }
-.dvp-badge-success {
-  font-size: 10px;
-  font-weight: 700;
-  padding: 2px 7px;
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--color-primary, #31cfa1) 18%, transparent);
-  color: var(--color-primary, #31cfa1);
-}
-.dvp-badge-failed {
-  font-size: 10px;
-  font-weight: 700;
-  padding: 2px 7px;
-  border-radius: 6px;
-  background: rgba(239, 68, 68, 0.18);
-  color: #ef4444;
+.dvp-badge-ms {
+  font-size: 10.5px;
+  font-weight: 650;
+  color: var(--color-text-secondary, rgba(148, 163, 184, 0.65));
+  font-variant-numeric: tabular-nums;
 }
 .dvp-badge-concept {
-  font-size: 10px;
-  font-weight: 700;
+  font-size: 10.5px;
+  font-weight: 750;
   padding: 2px 7px;
   border-radius: 6px;
-  background: rgba(59, 130, 246, 0.18);
-  color: #3b82f6;
+  background: color-mix(in srgb, #06b6d4 16%, transparent);
+  color: #06b6d4;
+  border: 1px solid color-mix(in srgb, #06b6d4 25%, transparent);
+}
+.dvp-badge-success {
+  font-size: 10.5px;
+  font-weight: 750;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, #10b981 16%, transparent);
+  color: #10b981;
+  border: 1px solid color-mix(in srgb, #10b981 25%, transparent);
+}
+.dvp-badge-failed {
+  font-size: 10.5px;
+  font-weight: 750;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, #ef4444 16%, transparent);
+  color: #ef4444;
+  border: 1px solid color-mix(in srgb, #ef4444 25%, transparent);
 }
 .dvp-modal-footer {
-  padding: 12px 20px;
+  padding: 14px 22px;
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 12px;
   border-top: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
+  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.02));
+}
+.dvp-btn-claim-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+  color: #ffffff;
+  border-radius: 10px;
+  padding: 8px 18px;
+  font-size: 12.5px;
+  font-weight: 750;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.32);
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.dvp-btn-claim-all:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(16, 185, 129, 0.45);
+  filter: brightness(1.05);
+}
+.dvp-btn-claim-all:active:not(:disabled) {
+  transform: translateY(0);
+}
+.dvp-btn-claim-all:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+.dvp-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.16));
+  background: transparent;
+  color: var(--color-text-secondary, rgba(148, 163, 184, 0.85));
+  border-radius: 10px;
+  padding: 7px 16px;
+  font-size: 12.5px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.dvp-btn-ghost:hover {
+  background: var(--control-hover-bg, rgba(148, 163, 184, 0.1));
+  color: var(--color-text-main, #f8fafc);
 }
 
 .dvp-logged-out {
@@ -1177,13 +1388,19 @@ const createLedgerModal = (ctx, Button) => {
       const refresh = async () => {
         loading.value = true;
         try {
+          const uid = readUserId(ctx);
           vipExpiry.value = formatExpiryText(readTvipEndTime(ctx));
           const [s, recs] = await Promise.all([
-            getLedgerStats(userVipState.userId),
-            getMonthRecordsCached(ctx),
+            getLedgerStats(uid),
+            getMonthRecordsCached(ctx).catch(() => []),
           ]);
           stats.value = s;
           streakDays.value = calculateStreakDays(recs);
+          // 冷启动自动回填：若账本记录为空，从当月已领记录一键恢复
+          if (stats.value.totalSuccess === 0 && recs && recs.length > 0) {
+            await backfillLedgerFromMonthRecords(ctx, uid);
+            stats.value = await getLedgerStats(uid);
+          }
         } catch (err) {
           console.warn('[daily-vip-claim] 刷新账本失败:', err);
         } finally {
@@ -1221,51 +1438,71 @@ const createLedgerModal = (ctx, Button) => {
             [
               // Header
               h('div', { class: 'dvp-modal-header' }, [
-                h('div', { class: 'dvp-modal-title' }, [
-                  iconSvg(h, ctx.icons.iconGift, { size: 18 }),
-                  h('span', null, '畅听VIP 打卡流水账本'),
+                h('div', { class: 'dvp-modal-title-box' }, [
+                  h('div', { class: 'dvp-modal-icon-wrap' }, [
+                    iconSvg(h, ctx.icons.iconGift, { size: 20 }),
+                  ]),
+                  h('div', { class: 'dvp-modal-titles' }, [
+                    h('div', { class: 'dvp-modal-title' }, '畅听VIP · 专属打卡流水账本'),
+                    h('div', { class: 'dvp-modal-subtitle' }, '每日白嫖自动续期 · SQLite 本地只读隐私账本'),
+                  ]),
                 ]),
                 h(
                   'button',
-                  { class: 'dvp-modal-close', onClick: () => { visible.value = false; } },
+                  { class: 'dvp-modal-close', title: '关闭', onClick: () => { visible.value = false; } },
                   '✕',
                 ),
               ]),
               // Body
               h('div', { class: 'dvp-modal-body' }, [
-                // 3 个统计大卡片
+                // 3 个三色美化统计大卡片
                 h('div', { class: 'dvp-stats-grid' }, [
-                  h('div', { class: 'dvp-stat-card' }, [
-                    h('span', { class: 'dvp-stat-label' }, '累计领取'),
-                    h('span', { class: 'dvp-stat-value' }, `${stats.value.totalSuccess} 天`),
+                  h('div', { class: 'dvp-stat-card stat-claim' }, [
+                    h('div', { class: 'dvp-stat-top' }, [
+                      h('span', null, '🎁'),
+                      h('span', null, '累计打卡'),
+                    ]),
+                    h('div', { class: 'dvp-stat-value' }, `${stats.value.totalSuccess} 天`),
+                    h('div', { class: 'dvp-stat-sub' }, '已累计免费续期'),
                   ]),
-                  h('div', { class: 'dvp-stat-card' }, [
-                    h('span', { class: 'dvp-stat-label' }, '连续打卡'),
-                    h('span', { class: 'dvp-stat-value' }, `${streakDays.value} 天`),
+                  h('div', { class: 'dvp-stat-card stat-streak' }, [
+                    h('div', { class: 'dvp-stat-top' }, [
+                      h('span', null, '🔥'),
+                      h('span', null, '连续签到'),
+                    ]),
+                    h('div', { class: 'dvp-stat-value' }, `${streakDays.value} 天`),
+                    h('div', { class: 'dvp-stat-sub' }, '保持打卡不中断'),
                   ]),
-                  h('div', { class: 'dvp-stat-card' }, [
-                    h('span', { class: 'dvp-stat-label' }, '累计节省约'),
-                    h('span', { class: 'dvp-stat-value', style: 'color: #f59e0b' }, `¥${stats.value.savedMoney}`),
+                  h('div', { class: 'dvp-stat-card stat-save' }, [
+                    h('div', { class: 'dvp-stat-top' }, [
+                      h('span', null, '💰'),
+                      h('span', null, '累计节省约'),
+                    ]),
+                    h('div', { class: 'dvp-stat-value' }, `¥${stats.value.savedMoney}`),
+                    h('div', { class: 'dvp-stat-sub' }, '折合会员费估算'),
                   ]),
                 ]),
-                // 状态条
+                // 状态胶囊条
                 h('div', { class: 'dvp-status-strip' }, [
-                  h('span', null, `会员状态：畅听到期 ${vipExpiry.value}`),
-                  h('span', { class: 'dvp-muted' }, `用户: ${userVipState.userId || '当前账号'}`),
+                  h('div', { class: 'dvp-status-left' }, [
+                    h('span', null, '👑'),
+                    h('span', null, `畅听 VIP · ${vipExpiry.value}`),
+                  ]),
+                  h('div', { class: 'dvp-status-user' }, `用户: ${readUserId(ctx) || '当前账号'}`),
                 ]),
-                // 最近流水标题
+                // 最近流水标题 + 刷新
                 h('div', { class: 'dvp-ledger-title' }, [
                   h('span', null, '打卡明细流水 (SQLite 本地账本)'),
                   h(
                     'button',
                     {
-                      class: 'dvp-toggle',
+                      class: 'dvp-btn-refresh',
                       disabled: loading.value,
                       onClick: refresh,
                     },
                     [
                       iconSvg(h, ctx.icons.iconRefreshCw, {
-                        size: 11,
+                        size: 12,
                         className: loading.value ? 'dvp-spin' : '',
                       }),
                       '刷新',
@@ -1275,7 +1512,10 @@ const createLedgerModal = (ctx, Button) => {
                 // 流水明细列表
                 h('div', { class: 'dvp-ledger-list' }, [
                   stats.value.recentLogs.length === 0
-                    ? h('div', { class: 'dvp-records-empty' }, '暂无打卡流水记录，点击立即续期开始记账')
+                    ? h('div', { class: 'dvp-records-empty' }, [
+                        iconSvg(h, ctx.icons.iconGift, { size: 28, className: 'dvp-muted' }),
+                        h('p', { style: 'margin: 6px 0 0;' }, '暂无打卡流水记录，点击下方按钮立即打卡记账'),
+                      ])
                     : stats.value.recentLogs.map((log) =>
                         h('div', { class: 'dvp-ledger-item', key: log.id || log.claimed_at }, [
                           h('div', { class: 'dvp-ledger-item-left' }, [
@@ -1287,7 +1527,7 @@ const createLedgerModal = (ctx, Button) => {
                             ),
                           ]),
                           h('div', { class: 'dvp-ledger-item-right' }, [
-                            log.duration_ms ? h('span', { class: 'dvp-muted' }, `${log.duration_ms}ms`) : null,
+                            log.duration_ms ? h('span', { class: 'dvp-badge-ms' }, `${log.duration_ms}ms`) : null,
                             log.concept_task_status
                               ? h('span', { class: 'dvp-badge-concept' }, '概念已打卡')
                               : null,
@@ -1296,7 +1536,7 @@ const createLedgerModal = (ctx, Button) => {
                               {
                                 class: log.status === 'success' ? 'dvp-badge-success' : 'dvp-badge-failed',
                               },
-                              log.upgrade_status ? '已升级' : (log.status === 'success' ? '已领取' : '失败'),
+                              log.upgrade_status ? '已升级' : (log.status === 'success' ? '畅听已领' : '打卡失败'),
                             ),
                           ]),
                         ]),
@@ -1306,23 +1546,24 @@ const createLedgerModal = (ctx, Button) => {
               // Footer
               h('div', { class: 'dvp-modal-footer' }, [
                 h(
-                  Button,
+                  'button',
                   {
-                    variant: 'ghost',
-                    size: 'small',
+                    class: 'dvp-btn-ghost',
                     onClick: () => { visible.value = false; },
                   },
-                  { default: () => '关闭' },
+                  '关闭',
                 ),
                 h(
-                  Button,
+                  'button',
                   {
-                    variant: 'primary',
-                    size: 'small',
+                    class: 'dvp-btn-claim-all',
                     disabled: loading.value,
                     onClick: handleClaimFromModal,
                   },
-                  { default: () => (loading.value ? '处理中...' : '立即全套打卡') },
+                  [
+                    iconSvg(h, ctx.icons.iconSparkles || ctx.icons.iconGift, { size: 14 }),
+                    loading.value ? '打卡处理中...' : '立即全套打卡',
+                  ],
                 ),
               ]),
             ],
@@ -1416,7 +1657,7 @@ const createClaimCard = (ctx, Button) => {
       });
 
       const statusParts = () => {
-        const parts = [`畅听到期 ${vipExpiry.value}`];
+        const parts = [`畅听 VIP · ${vipExpiry.value}`];
         if (monthCount.value != null) parts.push(`本月已领 ${monthCount.value} 天`);
         if (streakDays.value > 0) parts.push(`连续打卡 ${streakDays.value} 天`);
         if (savedMoney.value > 0) parts.push(`累计省约 ¥${savedMoney.value}`);
@@ -1725,10 +1966,7 @@ export function activate(ctx) {
     component: SettingsPanel,
   });
 
-  // 4. 任务中心注册（若宿主支持）
-  if (ctx.tasks && typeof ctx.tasks.register === 'function') {
-    ensureTaskRun(ctx, 'pending', { progress: { label: '就绪，等待下一次自动打卡' } });
-  }
+  // 4. 任务中心按需由打卡调用启动，不再注入常驻 pending 任务
 
   // 5. 初始化 SQLite 本地流水账本与弹窗
   void initLedgerDb(ctx);
