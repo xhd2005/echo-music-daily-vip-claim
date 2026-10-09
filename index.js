@@ -59,6 +59,38 @@ const userVipState = {
   lastUpdated: 0,
 };
 
+
+// 查询概念版 Young VIP 联合信息（KuGouMusicApi /v2/batch_union_vipinfo 接口）
+const fetchConceptUnionVipInfo = async (ctx, userId) => {
+  if (!userId) return null;
+  try {
+    const res = await sendInternalApiRequest(ctx, {
+      method: "POST",
+      url: "/v2/batch_union_vipinfo",
+      data: {
+        useridlist: [Number(userId)],
+        busi_type: "concept",
+        get_type: "2",
+      },
+    });
+    const busiVip = res?.body?.data?.busi_vip;
+    if (busiVip && typeof busiVip === "object") {
+      const userVipArr = busiVip[userId] || busiVip[Number(userId)];
+      if (Array.isArray(userVipArr)) {
+        const tvip = userVipArr.find(
+          (v) => v && (v.product_type === "tvip" || v.busi_type === "concept") && v.is_vip === 1,
+        );
+        if (tvip && tvip.vip_end_time) {
+          return tvip.vip_end_time;
+        }
+      }
+    }
+  } catch (err) {
+    // 降级非阻断
+  }
+  return null;
+};
+
 const readUserId = (ctx) => {
   try {
     const store = ctx.pinia && ctx.pinia._s && ctx.pinia._s.get('user');
@@ -593,60 +625,119 @@ const startClaimTask = (ctx, patch = {}) => {
   return taskHandle;
 };
 
-// ---- 标题栏动态天数胶囊管理 ----
+
+// ---- 标题栏与底栏双快捷入口管理 (支持 beta.9 playerbar API) ----
 
 let unregisterTitlebar = null;
+let unregisterPlayerbar = null;
+let playerbarBadgeText = "";
+let playerbarTooltipText = "畅听VIP · 每日自动续期与到期流水 (点击查看账本)";
+let playerbarClaimedToday = false;
 
-const updateTitlebarBadge = async (ctx) => {
-  if (!ctx.ui?.titlebar || typeof ctx.ui.titlebar.register !== 'function') return;
+const updateBadges = async (ctx) => {
   try {
     const ok = await isLoggedInCached(ctx);
-    let title = '畅听VIP';
-    let tooltip = '畅听VIP · 每日自动续期与到期流水 (点击查看账本)';
+    let title = "畅听VIP";
+    let tooltip = "畅听VIP · 每日自动续期与到期流水 (点击查看账本)";
+    let pBadge = "";
+    let isClaimed = false;
 
     if (ok === false) {
-      title = '畅听VIP · 未登录';
-      tooltip = '未登录酷狗账号，点击打开流水账本或去登录';
+      title = "畅听VIP · 未登录";
+      pBadge = "未登录";
+      tooltip = "未登录酷狗账号，点击打开流水账本或去登录";
     } else {
-      const endTime = readTvipEndTime(ctx);
+      const uid = readUserId(ctx);
+      let endTime = readTvipEndTime(ctx);
+      if (!endTime && uid) {
+        endTime = await fetchConceptUnionVipInfo(ctx, uid);
+        if (endTime) userVipState.tvipEndTime = endTime;
+      }
       const expiryText = formatExpiryText(endTime);
       const [records, ledger] = await Promise.all([
         getMonthRecordsCached(ctx).catch(() => []),
-        getLedgerStats(userVipState.userId),
+        getLedgerStats(uid),
       ]);
       const streak = calculateStreakDays(records);
       const claimedToday = isTodayClaimed(records);
+      isClaimed = claimedToday;
       const totalDays = ledger.totalSuccess || 0;
       const saved = ledger.savedMoney || 0;
 
-      if (expiryText === '已过期') {
-        title = '畅听VIP · 已过期';
-      } else if (expiryText !== '--') {
+      if (expiryText === "已过期") {
+        title = "畅听VIP · 已过期";
+        pBadge = "已过期";
+      } else if (expiryText !== "--") {
         title = claimedToday ? `✓ 畅听VIP · ${expiryText}` : `畅听VIP · ${expiryText}`;
+        pBadge = claimedToday ? `✓ ${expiryText}` : expiryText;
       }
 
       tooltip = `畅听VIP · 到期: ${expiryText} · 连续打卡: ${streak}天 · 累计打卡: ${totalDays}天 (省¥${saved}) · 点击查看账本`;
     }
 
-    unregisterTitlebar = ctx.ui.titlebar.register({
-      id: 'daily-vip-badge',
-      title,
-      icon: ctx.icons?.iconGift || {
-        width: 24,
-        height: 24,
-        body: '<path fill="currentColor" d="M20 12v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9H2V7a1 1 0 0 1 1-1h4.17a3 3 0 0 1 5.66-1.41A3 3 0 0 1 16.83 6H21a1 1 0 0 1 1 1v5h-2zm-2 2H6v6h12v-6zm2-6H4v2h16V8z"/>',
-      },
-      tooltip,
-      defaultPlacement: 'toolbar',
-      order: 25,
-      onClick: () => {
-        void ledgerModalState.open?.();
-      },
-    });
+    playerbarBadgeText = pBadge;
+    playerbarTooltipText = tooltip;
+    playerbarClaimedToday = isClaimed;
+
+    // 1. 标题栏直达徽章
+    if (ctx.ui?.titlebar && typeof ctx.ui.titlebar.register === "function") {
+      try {
+        if (unregisterTitlebar) unregisterTitlebar();
+      } catch {}
+      unregisterTitlebar = ctx.ui.titlebar.register({
+        id: "daily-vip-badge",
+        title,
+        icon: ctx.icons?.iconGift || {
+          width: 24,
+          height: 24,
+          body: "<path fill=\"currentColor\" d=\"M20 12v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9H2V7a1 1 0 0 1 1-1h4.17a3 3 0 0 1 5.66-1.41A3 3 0 0 1 16.83 6H21a1 1 0 0 1 1 1v5h-2zm-2 2H6v6h12v-6zm2-6H4v2h16V8z\"/>",
+        },
+        tooltip,
+        defaultPlacement: "toolbar",
+        order: 25,
+        onClick: () => {
+          void ledgerModalState.open?.();
+        },
+      });
+    }
+
+    // 2. 底栏 Playerbar 快捷胶囊 (EchoMusic beta.9 新增 API)
+    if (ctx.ui?.playerbar && typeof ctx.ui.playerbar.register === "function") {
+      const showInPlayerbar = Boolean(await ctx.storage.get("playerbarBadge") ?? true);
+      if (showInPlayerbar) {
+        try {
+          if (unregisterPlayerbar) unregisterPlayerbar();
+        } catch {}
+        unregisterPlayerbar = ctx.ui.playerbar.register({
+          id: "daily-vip-claim-playerbar",
+          title: "畅听VIP",
+          icon: ctx.icons?.iconGift || {
+            width: 24,
+            height: 24,
+            body: "<path fill=\"currentColor\" d=\"M20 12v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-9H2V7a1 1 0 0 1 1-1h4.17a3 3 0 0 1 5.66-1.41A3 3 0 0 1 16.83 6H21a1 1 0 0 1 1 1v5h-2zm-2 2H6v6h12v-6zm2-6H4v2h16V8z\"/>",
+          },
+          tooltip,
+          badge: () => playerbarBadgeText || null,
+          badgeTitle: "畅听VIP",
+          badgeDefaultVisible: true,
+          defaultPlacement: "right",
+          order: 950,
+          onClick: async () => {
+            if (!playerbarClaimedToday) {
+              await maybeAutoClaim(ctx, true);
+            } else {
+              void ledgerModalState.open?.();
+            }
+          },
+        });
+      }
+    }
   } catch (err) {
-    console.warn('[daily-vip-claim] 刷新标题栏徽章异常:', err);
+    console.warn("[daily-vip-claim] 刷新徽章状态异常:", err);
   }
 };
+
+const updateTitlebarBadge = updateBadges;
 
 // ---- 领取卡片共享状态/动作 ----
 // onAfterClaim：领取成功后回调（卡片用它刷新到期/统计状态）
@@ -800,37 +891,50 @@ const CSS = `
 .dvp-header {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   margin: 20px 0 24px;
 }
 
 .dvp-header-icon {
-  color: var(--color-primary, #31cfa1);
+  color: var(--color-primary, #00cc65);
+  flex-shrink: 0;
 }
 
 .dvp-title {
   margin: 0;
-  font-size: 22px;
-  font-weight: 900;
-  letter-spacing: -0.02em;
-  color: var(--color-text-main, #f8fafc);
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--text-main, #ffffff);
 }
 
+/* 嵌入式领取卡片 (与 Profile.vue 会员卡同层级风格) */
 .dvp-card {
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.16));
-  border-radius: 18px;
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.08));
-  box-shadow: var(--shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.2));
-  padding: 16px;
+  border: 1px solid var(--border-light, #444446);
+  border-radius: 16px;
+  background: var(--surface-card-base, #343436);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: var(--shadow-card, none);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-/* 个人中心嵌入版：贴紧会员状态卡的视觉语言 */
 .dvp-card-inline {
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.16));
+  border: 1px solid var(--border-light, #444446);
   border-radius: 16px;
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.08));
-  padding: 12px;
-  min-width: 0;
+  background: var(--surface-card-base, #343436);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.dvp-card-inline:hover, .dvp-card:hover {
+  border-color: color-mix(in srgb, var(--color-primary, #00cc65) 30%, var(--border-light, #444446));
 }
 
 .dvp-claim-row {
@@ -843,461 +947,510 @@ const CSS = `
 .dvp-claim-copy {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   min-width: 0;
 }
 
 .dvp-claim-icon {
-  width: 36px;
-  height: 36px;
-  flex-shrink: 0;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-primary, #00cc65) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-primary, #00cc65) 24%, transparent);
+  color: var(--color-primary, #00cc65);
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--color-primary, #31cfa1) 10%, transparent);
-  color: var(--color-primary, #31cfa1);
+  flex-shrink: 0;
 }
 
 .dvp-claim-icon-sm {
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
 }
 
 .dvp-claim-title {
   margin: 0;
-  font-size: 13px;
-  font-weight: 900;
-  color: var(--color-text-main, #f8fafc);
-}
-
-.dvp-muted {
-  margin: 2px 0 0;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.9));
-  opacity: 0.6;
+  font-size: 14px;
+  font-weight: 750;
+  color: var(--text-main, #ffffff);
 }
 
 .dvp-status {
-  margin-top: 10px;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.9));
-  opacity: 0.75;
+  font-size: 12px;
+  color: var(--text-secondary, #bcbcbc);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
+.dvp-muted {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-secondary, #bcbcbc);
+}
+
+/* 记录抽屉 */
 .dvp-records-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-light, #444446);
+  font-size: 11.5px;
 }
 
 .dvp-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  border: none;
+  gap: 4px;
   background: none;
-  padding: 2px;
-  color: var(--color-primary, #31cfa1);
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
+  border: none;
+  color: var(--text-secondary, #bcbcbc);
+  font-size: 11.5px;
   cursor: pointer;
-  transition: opacity 0.15s;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: all 0.15s;
 }
 
-.dvp-toggle:hover {
-  opacity: 0.9;
-}
-
-.dvp-toggle:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
+.dvp-toggle:hover:not(:disabled) {
+  color: var(--text-main, #ffffff);
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.06));
 }
 
 .dvp-records-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  max-height: 144px;
+  gap: 6px;
+  max-height: 160px;
   overflow-y: auto;
-  margin-top: 8px;
+  padding-right: 4px;
+}
+
+.dvp-records-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.dvp-records-list::-webkit-scrollbar-thumb {
+  background: var(--border-light, #444446);
+  border-radius: 999px;
 }
 
 .dvp-record {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-radius: 8px;
-  background: var(--control-muted-bg, rgba(148, 163, 184, 0.1));
   padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border-light, #444446);
+  font-size: 11.5px;
 }
 
 .dvp-record-date {
-  font-size: 11px;
-  font-weight: 900;
-  color: var(--color-text-main, #f8fafc);
+  color: var(--text-main, #ffffff);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 .dvp-record-label {
-  font-size: 10px;
+  color: var(--color-primary, #00cc65);
   font-weight: 700;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.9));
-  opacity: 0.6;
 }
 
 .dvp-records-empty {
-  padding: 6px 10px;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.9));
-  opacity: 0.6;
+  font-size: 11.5px;
+  color: var(--text-secondary, #bcbcbc);
+  text-align: center;
+  padding: 16px 8px;
 }
 
+/* 账本全景弹窗 (100% 对齐 EchoMusic 原生 Dialog.vue 标准) */
 .dvp-modal-mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.68);
-  backdrop-filter: blur(12px);
+  background: var(--surface-overlay-bg, rgba(0, 0, 0, 0.45));
+  backdrop-filter: blur(8px);
   z-index: 9999;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 20px;
+  padding: 24px;
 }
+
 .dvp-modal {
-  width: 530px;
+  width: 520px;
   max-width: 94vw;
-  max-height: 88vh;
-  background: var(--color-bg-container, #16181d);
-  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
-  border-radius: 20px;
-  box-shadow: 0 24px 60px -8px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  max-height: 86vh;
+  background: var(--bg-dialog, #29292b);
+  border: 1px solid var(--border-light, #444446);
+  border-radius: 16px;
+  box-shadow: var(--shadow-dialog, 0 24px 60px rgba(0, 0, 0, 0.42));
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  color: var(--color-text-main, #f8fafc);
-  animation: dvp-modal-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  color: var(--text-main, #ffffff);
+  animation: dvp-modal-scale-in 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
-@keyframes dvp-modal-in {
-  from { opacity: 0; transform: scale(0.95) translateY(8px); }
-  to { opacity: 1; transform: scale(1) translateY(0); }
+
+@keyframes dvp-modal-scale-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
 }
+
 .dvp-modal-header {
-  padding: 18px 22px;
+  padding: 16px 20px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-bottom: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.04));
+  border-bottom: 1px solid var(--border-light, #444446);
+  background: var(--bg-dialog, #29292b);
+  flex-shrink: 0;
 }
+
 .dvp-modal-title-box {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
+
 .dvp-modal-icon-wrap {
-  width: 38px;
-  height: 38px;
-  border-radius: 11px;
-  background: color-mix(in srgb, #31cfa1 16%, transparent);
-  border: 1px solid color-mix(in srgb, #31cfa1 30%, transparent);
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-primary, #00cc65) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-primary, #00cc65) 24%, transparent);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #31cfa1;
-  box-shadow: 0 4px 14px color-mix(in srgb, #31cfa1 20%, transparent);
+  color: var(--color-primary, #00cc65);
 }
+
 .dvp-modal-titles {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
 }
+
 .dvp-modal-title {
-  font-size: 16px;
-  font-weight: 850;
-  color: var(--color-text-main, #f8fafc);
-  letter-spacing: -0.01em;
+  font-size: 15px;
+  font-weight: 750;
+  color: var(--text-main, #ffffff);
+  line-height: 1.25;
 }
+
 .dvp-modal-subtitle {
   font-size: 11px;
   font-weight: 500;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.75));
+  color: var(--text-secondary, #bcbcbc);
 }
+
 .dvp-modal-close {
-  width: 32px;
-  height: 32px;
-  border-radius: 10px;
-  background: var(--control-muted-bg, rgba(148, 163, 184, 0.08));
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.12));
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
   cursor: pointer;
-  color: var(--color-text-secondary, #94a3b8);
+  color: var(--text-secondary, #bcbcbc);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 14px;
-  transition: all 0.18s ease;
+  transition: all 0.15s ease;
 }
+
 .dvp-modal-close:hover {
-  background: rgba(255, 255, 255, 0.12);
-  color: #fff;
-  border-color: rgba(255, 255, 255, 0.2);
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.08));
+  color: var(--text-main, #ffffff);
 }
+
 .dvp-modal-body {
-  padding: 20px 22px;
+  padding: 18px 20px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
 }
+
+.dvp-modal-body::-webkit-scrollbar {
+  width: 5px;
+}
+
+.dvp-modal-body::-webkit-scrollbar-thumb {
+  background: var(--border-light, #444446);
+  border-radius: 999px;
+}
+
+/* 顶部三大统计卡片 (完全契合 EchoMusic 卡片规范) */
 .dvp-stats-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
+  gap: 10px;
 }
+
 .dvp-stat-card {
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.14));
-  border-radius: 14px;
-  padding: 14px 12px;
+  border: 1px solid var(--border-light, #444446);
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: var(--surface-card-base, #343436);
   display: flex;
   flex-direction: column;
   align-items: center;
   text-align: center;
-  gap: 4px;
-  position: relative;
-  overflow: hidden;
-  transition: transform 0.18s ease, border-color 0.18s ease;
+  gap: 2px;
+  transition: all 0.18s ease;
 }
+
 .dvp-stat-card:hover {
-  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--color-primary, #00cc65) 30%, var(--border-light, #444446));
 }
-.dvp-stat-card.stat-claim {
-  background: linear-gradient(145deg, color-mix(in srgb, #31cfa1 10%, transparent) 0%, var(--color-bg-elevated, rgba(148, 163, 184, 0.04)) 100%);
-  border-color: color-mix(in srgb, #31cfa1 25%, transparent);
-}
-.dvp-stat-card.stat-streak {
-  background: linear-gradient(145deg, color-mix(in srgb, #f59e0b 10%, transparent) 0%, var(--color-bg-elevated, rgba(148, 163, 184, 0.04)) 100%);
-  border-color: color-mix(in srgb, #f59e0b 25%, transparent);
-}
-.dvp-stat-card.stat-save {
-  background: linear-gradient(145deg, color-mix(in srgb, #fbbf24 10%, transparent) 0%, var(--color-bg-elevated, rgba(148, 163, 184, 0.04)) 100%);
-  border-color: color-mix(in srgb, #fbbf24 25%, transparent);
-}
+
 .dvp-stat-top {
   display: flex;
   align-items: center;
   gap: 4px;
-  font-size: 11.5px;
-  font-weight: 700;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.85));
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--text-secondary, #bcbcbc);
 }
+
 .dvp-stat-value {
-  font-size: 24px;
-  font-weight: 850;
-  letter-spacing: -0.02em;
+  font-size: 22px;
+  font-weight: 800;
   font-variant-numeric: tabular-nums;
-  line-height: 1.15;
+  line-height: 1.2;
 }
-.stat-claim .dvp-stat-value { color: #31cfa1; }
+
+.stat-claim .dvp-stat-value { color: var(--color-primary, #00cc65); }
 .stat-streak .dvp-stat-value { color: #f59e0b; }
 .stat-save .dvp-stat-value { color: #fbbf24; }
+
 .dvp-stat-sub {
   font-size: 10px;
-  font-weight: 600;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.65));
+  font-weight: 500;
+  color: var(--text-secondary, #bcbcbc);
+  opacity: 0.8;
 }
+
+/* 状态胶囊条 */
 .dvp-status-strip {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
-  border-radius: 12px;
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.06));
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.12));
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--bg-elevated, #29292b);
+  border: 1px solid var(--border-light, #444446);
   font-size: 12px;
 }
+
 .dvp-status-left {
   display: flex;
   align-items: center;
-  gap: 7px;
-  font-weight: 750;
-  color: var(--color-text-main, #f8fafc);
+  gap: 6px;
+  font-weight: 700;
+  color: var(--text-main, #ffffff);
 }
+
 .dvp-status-user {
   font-size: 11px;
-  font-weight: 650;
+  font-weight: 600;
   padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--control-muted-bg, rgba(148, 163, 184, 0.1));
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.85));
+  border-radius: 6px;
+  background: var(--surface-card-base, #343436);
+  color: var(--text-secondary, #bcbcbc);
+  border: 1px solid var(--border-light, #444446);
 }
+
+/* 流水标题栏 */
 .dvp-ledger-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 12.5px;
-  font-weight: 800;
-  color: var(--color-text-main, #f8fafc);
+  font-size: 12px;
+  font-weight: 750;
+  color: var(--text-main, #ffffff);
   margin-top: 2px;
 }
+
 .dvp-btn-refresh {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 4px 10px;
-  border-radius: 8px;
-  background: var(--control-muted-bg, rgba(148, 163, 184, 0.08));
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.14));
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.85));
-  font-size: 11.5px;
-  font-weight: 700;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--surface-card-base, #343436);
+  border: 1px solid var(--border-light, #444446);
+  color: var(--text-secondary, #bcbcbc);
+  font-size: 11px;
+  font-weight: 650;
   cursor: pointer;
   transition: all 0.15s ease;
 }
-.dvp-btn-refresh:hover {
-  background: color-mix(in srgb, #31cfa1 12%, transparent);
-  border-color: color-mix(in srgb, #31cfa1 30%, transparent);
-  color: #31cfa1;
+
+.dvp-btn-refresh:hover:not(:disabled) {
+  border-color: var(--color-primary, #00cc65);
+  color: var(--color-primary, #00cc65);
 }
+
+/* 流水明细列表 */
 .dvp-ledger-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-height: 230px;
+  gap: 6px;
+  max-height: 220px;
   overflow-y: auto;
-  padding-right: 4px;
+  padding-right: 2px;
 }
+
 .dvp-ledger-list::-webkit-scrollbar {
   width: 4px;
 }
+
 .dvp-ledger-list::-webkit-scrollbar-thumb {
-  background: var(--border-subtle, rgba(148, 163, 184, 0.2));
+  background: var(--border-light, #444446);
   border-radius: 999px;
 }
+
 .dvp-ledger-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.05));
-  border-radius: 11px;
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.1));
+  padding: 8px 12px;
+  background: var(--surface-card-base, #343436);
+  border-radius: 9px;
+  border: 1px solid var(--border-light, #444446);
   transition: background 0.12s ease;
 }
+
 .dvp-ledger-item:hover {
-  background: var(--control-hover-bg, rgba(148, 163, 184, 0.09));
+  background: var(--bg-elevated, #29292b);
 }
+
 .dvp-ledger-item-left {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
 }
+
 .dvp-ledger-date {
-  font-size: 12.5px;
-  font-weight: 750;
-  color: var(--color-text-main, #f8fafc);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-main, #ffffff);
   font-variant-numeric: tabular-nums;
 }
+
 .dvp-ledger-time {
   font-size: 11px;
   font-weight: 500;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.75));
+  color: var(--text-secondary, #bcbcbc);
 }
+
 .dvp-ledger-item-right {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
 }
+
 .dvp-badge-ms {
-  font-size: 10.5px;
-  font-weight: 650;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.65));
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary, #bcbcbc);
   font-variant-numeric: tabular-nums;
 }
+
 .dvp-badge-concept {
-  font-size: 10.5px;
-  font-weight: 750;
-  padding: 2px 7px;
-  border-radius: 6px;
-  background: color-mix(in srgb, #06b6d4 16%, transparent);
-  color: #06b6d4;
-  border: 1px solid color-mix(in srgb, #06b6d4 25%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, #0ea5e9 14%, transparent);
+  color: #0ea5e9;
+  border: 1px solid color-mix(in srgb, #0ea5e9 24%, transparent);
 }
+
 .dvp-badge-success {
-  font-size: 10.5px;
-  font-weight: 750;
-  padding: 2px 8px;
-  border-radius: 6px;
-  background: color-mix(in srgb, #10b981 16%, transparent);
-  color: #10b981;
-  border: 1px solid color-mix(in srgb, #10b981 25%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--color-primary, #00cc65) 14%, transparent);
+  color: var(--color-primary, #00cc65);
+  border: 1px solid color-mix(in srgb, var(--color-primary, #00cc65) 24%, transparent);
 }
+
 .dvp-badge-failed {
-  font-size: 10.5px;
-  font-weight: 750;
-  padding: 2px 8px;
-  border-radius: 6px;
-  background: color-mix(in srgb, #ef4444 16%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, #ef4444 14%, transparent);
   color: #ef4444;
-  border: 1px solid color-mix(in srgb, #ef4444 25%, transparent);
+  border: 1px solid color-mix(in srgb, #ef4444 24%, transparent);
 }
+
+/* 底部操作区 (标准 EchoMusic 弹窗按钮组) */
 .dvp-modal-footer {
-  padding: 14px 22px;
+  padding: 14px 20px;
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 12px;
-  border-top: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.08));
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.02));
+  gap: 10px;
+  border-top: 1px solid var(--border-light, #444446);
+  background: var(--bg-dialog, #29292b);
+  flex-shrink: 0;
 }
-.dvp-btn-claim-all {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: none;
-  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-  color: #ffffff;
-  border-radius: 10px;
-  padding: 8px 18px;
-  font-size: 12.5px;
-  font-weight: 750;
-  cursor: pointer;
-  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.32);
-  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.dvp-btn-claim-all:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 6px 18px rgba(16, 185, 129, 0.45);
-  filter: brightness(1.05);
-}
-.dvp-btn-claim-all:active:not(:disabled) {
-  transform: translateY(0);
-}
-.dvp-btn-claim-all:disabled {
-  opacity: 0.65;
-  cursor: not-allowed;
-}
+
 .dvp-btn-ghost {
   display: inline-flex;
   align-items: center;
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.16));
+  justify-content: center;
+  border: 1px solid var(--border-light, #444446);
   background: transparent;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.85));
-  border-radius: 10px;
-  padding: 7px 16px;
-  font-size: 12.5px;
-  font-weight: 650;
+  color: var(--text-secondary, #bcbcbc);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
   cursor: pointer;
   transition: all 0.15s ease;
 }
+
 .dvp-btn-ghost:hover {
-  background: var(--control-hover-bg, rgba(148, 163, 184, 0.1));
-  color: var(--color-text-main, #f8fafc);
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.08));
+  color: var(--text-main, #ffffff);
+}
+
+.dvp-btn-claim-all {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: none;
+  background: var(--color-primary, #00cc65);
+  color: var(--color-on-primary, #000000);
+  border-radius: 8px;
+  padding: 6px 16px;
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--color-primary, #00cc65) 25%, transparent);
+}
+
+.dvp-btn-claim-all:hover:not(:disabled) {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+
+.dvp-btn-claim-all:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .dvp-logged-out {
@@ -1305,63 +1458,64 @@ const CSS = `
   flex-direction: column;
   align-items: center;
   gap: 14px;
-  border: 1px solid var(--border-subtle, rgba(148, 163, 184, 0.16));
-  border-radius: 18px;
-  background: var(--color-bg-elevated, rgba(148, 163, 184, 0.08));
+  border: 1px solid var(--border-light, #444446);
+  border-radius: 16px;
+  background: var(--surface-card-base, #343436);
   padding: 48px 24px;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.9));
+  color: var(--text-secondary, #bcbcbc);
 }
 
 .dvp-logged-out p {
   margin: 0;
   font-size: 13px;
-  font-weight: 700;
+  font-weight: 650;
 }
 
 /* 插件设置面板 */
 .dvp-settings {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
 }
 
 .dvp-setting-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 16px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--surface-card-base, #343436);
+  border: 1px solid var(--border-light, #444446);
 }
 
 .dvp-setting-copy {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  min-width: 0;
+  gap: 2px;
 }
 
 .dvp-setting-label {
   font-size: 13px;
-  font-weight: 900;
-  color: var(--color-text-main, #f8fafc);
+  font-weight: 750;
+  color: var(--text-main, #ffffff);
 }
 
 .dvp-setting-hint {
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--color-text-secondary, rgba(148, 163, 184, 0.9));
-  opacity: 0.6;
-}
-
-@keyframes dvp-spin {
-  to {
-    transform: rotate(360deg);
-  }
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-secondary, #bcbcbc);
 }
 
 .dvp-spin {
-  animation: dvp-spin 1s linear infinite;
+  animation: dvp-spin 0.9s linear infinite;
   transform-origin: center;
   transform-box: fill-box;
+}
+
+@keyframes dvp-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 `;
 
@@ -1918,43 +2072,66 @@ export function activate(ctx) {
 
   // 3. 插件设置项：自动领取开关 + 快速领取卡片
   const SettingsPanel = defineComponent({
-    name: 'daily-vip-claim-settings',
+    name: "daily-vip-claim-settings",
     setup() {
       const autoClaim = ref(false);
+      const playerbarBadge = ref(true);
       const loaded = ref(false);
 
       onMounted(async () => {
         try {
-          autoClaim.value = Boolean(await ctx.storage.get('autoClaim'));
+          autoClaim.value = Boolean(await ctx.storage.get("autoClaim"));
+          playerbarBadge.value = Boolean(await ctx.storage.get("playerbarBadge") ?? true);
         } catch (error) {
-          console.warn('[daily-vip-claim] 读取设置失败:', error);
+          console.warn("[daily-vip-claim] 读取设置失败:", error);
         }
         loaded.value = true;
       });
 
       const setAutoClaim = (value) => {
         autoClaim.value = Boolean(value);
-        void ctx.storage.set('autoClaim', autoClaim.value).catch(() => {});
+        void ctx.storage.set("autoClaim", autoClaim.value).catch(() => {});
+      };
+
+      const setPlayerbarBadge = async (value) => {
+        playerbarBadge.value = Boolean(value);
+        await ctx.storage.set("playerbarBadge", playerbarBadge.value).catch(() => {});
+        void updateBadges(ctx);
       };
 
       return () =>
-        h('div', { class: 'dvp-settings' }, [
-          h('div', { class: 'dvp-setting-row' }, [
-            h('div', { class: 'dvp-setting-copy' }, [
-              h('div', { class: 'dvp-setting-label' }, '启动后自动领取'),
+        h("div", { class: "dvp-settings" }, [
+          h("div", { class: "dvp-setting-row" }, [
+            h("div", { class: "dvp-setting-copy" }, [
+              h("div", { class: "dvp-setting-label" }, "启动后自动领取"),
               h(
-                'div',
-                { class: 'dvp-setting-hint' },
-                '启动 / 休眠唤醒 / 每小时检查一次；今日已领取时静默跳过，失败自动重试一次',
+                "div",
+                { class: "dvp-setting-hint" },
+                "启动 / 休眠唤醒 / 每小时检查一次；今日已领取时静默跳过，失败自动重试一次",
               ),
             ]),
             h(Switch, {
               modelValue: autoClaim.value,
-              'onUpdate:modelValue': setAutoClaim,
+              "onUpdate:modelValue": setAutoClaim,
               disabled: !loaded.value,
             }),
           ]),
-          h(ClaimCard, { variant: 'card' }),
+          h("div", { class: "dvp-setting-row" }, [
+            h("div", { class: "dvp-setting-copy" }, [
+              h("div", { class: "dvp-setting-label" }, "播放栏快捷 VIP 胶囊 (Playerbar)"),
+              h(
+                "div",
+                { class: "dvp-setting-hint" },
+                "在底部播放栏右侧常驻显示 VIP 到期天数胶囊与快捷打卡入口 (支持 beta.9+)",
+              ),
+            ]),
+            h(Switch, {
+              modelValue: playerbarBadge.value,
+              "onUpdate:modelValue": setPlayerbarBadge,
+              disabled: !loaded.value,
+            }),
+          ]),
+          h(ClaimCard, { variant: "card" }),
         ]);
     },
   });
@@ -1980,8 +2157,39 @@ export function activate(ctx) {
     }
   }
 
-  // 6. 标题栏常驻会员直达胶囊（动态天数显示）
-  void updateTitlebarBadge(ctx);
+  // 6. 标题栏与底栏常驻会员直达胶囊（动态天数显示）
+  void updateBadges(ctx);
+
+  // 6.1 监听多账号切换（支持 EchoMusic beta.9 多账号切换与会话生命周期）
+  let sessionDisposer = null;
+  try {
+    const userStore = ctx.pinia?._s?.get("user");
+    if (userStore && typeof userStore.$subscribe === "function") {
+      let lastUid = String(userStore.info?.userid ?? userStore.info?.userId ?? "");
+      let lastRev = Number(userStore.accountRevision || 0);
+      let lastLoggedIn = Boolean(userStore.isLoggedIn);
+
+      sessionDisposer = userStore.$subscribe(() => {
+        const curUid = String(userStore.info?.userid ?? userStore.info?.userId ?? "");
+        const curRev = Number(userStore.accountRevision || 0);
+        const curLoggedIn = Boolean(userStore.isLoggedIn);
+        if (curUid !== lastUid || curRev !== lastRev || curLoggedIn !== lastLoggedIn) {
+          lastUid = curUid;
+          lastRev = curRev;
+          lastLoggedIn = curLoggedIn;
+          userVipState.userId = curUid;
+          userVipState.tvipEndTime = null;
+          userVipState.isVip = false;
+          monthRecordCache.at = 0;
+          console.info("[daily-vip-claim] 感知到账号会话切换:", curUid || "未登录");
+          void refreshUserInfoBestEffort(ctx);
+          void updateBadges(ctx);
+        }
+      });
+    }
+  } catch (err) {
+    console.warn("[daily-vip-claim] 注册账号会话监听失败:", err);
+  }
 
   // 7. 服务请求拦截：无缝感知用户 VIP 与登录态更新
   let unintercept = null;
@@ -2072,6 +2280,18 @@ export function activate(ctx) {
         unregisterTitlebar();
       } catch {}
       unregisterTitlebar = null;
+    }
+    if (unregisterPlayerbar) {
+      try {
+        unregisterPlayerbar();
+      } catch {}
+      unregisterPlayerbar = null;
+    }
+    if (sessionDisposer) {
+      try {
+        sessionDisposer();
+      } catch {}
+      sessionDisposer = null;
     }
     if (unmountModal) {
       try {

@@ -5,8 +5,14 @@
     {
       "id": "daily-vip-claim",
       "repo": "xhd2005/echo-music-daily-vip-claim",
-      "downloadUrl": "https://github.com/xhd2005/echo-music-daily-vip-claim/releases/download/v2.1.1/daily-vip-claim-v2.1.1.zip",
-      "tags": ["vip", "会员", "畅听", "每日领取", "打卡"]
+      "downloadUrl": "https://github.com/xhd2005/echo-music-daily-vip-claim/releases/download/v2.2.0/daily-vip-claim-v2.2.0.zip",
+      "tags": [
+        "vip",
+        "会员",
+        "畅听",
+        "每日领取",
+        "打卡"
+      ]
     }
   ]
 }
