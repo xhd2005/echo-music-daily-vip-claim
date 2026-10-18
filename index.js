@@ -566,6 +566,46 @@ const refreshUserInfoBestEffort = (ctx) => {
 
 // 用 iconify 数据对象直接渲染内联 SVG（宿主全局 Icon 组件只在宿主渲染树
 // 内可解析；自建迷你 app 中不可用，统一走此路径，两种上下文都安全）
+
+const ICONS = {
+  gift: {
+    width: 24, height: 24,
+    body: "<path fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M3 12h18v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-8zm-1-4a1 1 0 0 1 1-1h18a1 1 0 0 1 1 1v4H2V8zm10-5a2.5 2.5 0 0 0-2.5 2.5V7h5v-1.5A2.5 2.5 0 0 0 12 3zm0 4V3m-4 4h8m-4 5v10\"/>",
+  },
+  flame: {
+    width: 24, height: 24,
+    body: "<path fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M12 2c.5 3 2.5 5 4.5 7.5 2 2.5 2.5 5.5 1.5 8.5-1.5 4-5.5 6-9 4.5-3.5-1.5-5-5-3.5-9 1-2.5 3-4.5 4-7 .5 2 1.5 3 2.5 3.5 0-2.5 0-5 0-7.5z\"/>",
+  },
+  coin: {
+    width: 24, height: 24,
+    body: "<circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><path d=\"M14.5 9h-4a1.5 1.5 0 0 0 0 3h3a1.5 1.5 0 0 1 0 3h-4m2.5-8v10\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>",
+  },
+  crown: {
+    width: 24, height: 24,
+    body: "<path fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M4 19h16M5 16l2-9 5 4 5-4 2 9H5z\"/>",
+  },
+  sparkles: {
+    width: 24, height: 24,
+    body: "<path fill=\"currentColor\" d=\"M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3zM19 16l1 3 3 1-3 1-1 3-1-3-3-1 3-1 1-3zM5 16l.8 2.2L8 19l-2.2.8L5 22l-.8-2.2L2 19l2.2-.8L5 16z\"/>",
+  },
+  check: {
+    width: 24, height: 24,
+    body: "<path fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M5 12l5 5L20 7\"/>",
+  },
+  close: {
+    width: 24, height: 24,
+    body: "<path fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M18 6L6 18M6 6l12 12\"/>",
+  },
+  loader: {
+    width: 24, height: 24,
+    body: "<path fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83\"/>",
+  },
+  clock: {
+    width: 24, height: 24,
+    body: "<circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"/><path d=\"M12 7v5l3 3\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"/>",
+  },
+};
+
 const iconSvg = (h, iconData, { size = 18, className = '' } = {}) =>
   h('svg', {
     xmlns: 'http://www.w3.org/2000/svg',
@@ -668,8 +708,8 @@ const updateBadges = async (ctx) => {
         title = "畅听VIP · 已过期";
         pBadge = "已过期";
       } else if (expiryText !== "--") {
-        title = claimedToday ? `✓ 畅听VIP · ${expiryText}` : `畅听VIP · ${expiryText}`;
-        pBadge = claimedToday ? `✓ ${expiryText}` : expiryText;
+        title = claimedToday ? `已续期 · 畅听VIP · ${expiryText}` : `畅听VIP · ${expiryText}`;
+        pBadge = claimedToday ? `已续期 ${expiryText}` : expiryText;
       }
 
       tooltip = `畅听VIP · 到期: ${expiryText} · 连续打卡: ${streak}天 · 累计打卡: ${totalDays}天 (省¥${saved}) · 点击查看账本`;
@@ -1236,6 +1276,96 @@ const CSS = `
 }
 
 /* 状态胶囊条 */
+
+/* 7天连胜轨道 (Streak Rail) */
+.dvp-streak-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: var(--surface-card-base, #343436);
+  border: 1px solid var(--border-light, #444446);
+}
+.dvp-streak-rail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary, #bcbcbc);
+}
+.dvp-streak-rail-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-main, #ffffff);
+}
+.dvp-streak-nodes {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: relative;
+  padding: 4px 6px;
+}
+.dvp-streak-nodes::before {
+  content: "";
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  right: 14px;
+  height: 2px;
+  background: var(--border-light, #444446);
+  z-index: 1;
+}
+.dvp-streak-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  position: relative;
+  z-index: 2;
+}
+.dvp-node-dot {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--bg-dialog, #29292b);
+  border: 1.5px solid var(--border-light, #444446);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9.5px;
+  font-weight: 750;
+  color: var(--text-secondary, #bcbcbc);
+  font-variant-numeric: tabular-nums;
+  transition: all 0.2s ease;
+}
+.dvp-streak-node.is-done .dvp-node-dot {
+  background: var(--color-primary, #00cc65);
+  border-color: var(--color-primary, #00cc65);
+  color: #000;
+  box-shadow: 0 0 8px color-mix(in srgb, var(--color-primary, #00cc65) 45%, transparent);
+}
+.dvp-streak-node.is-active .dvp-node-dot {
+  border-color: var(--color-primary, #00cc65);
+  color: var(--color-primary, #00cc65);
+  animation: dvp-pulse 1.8s infinite;
+}
+.dvp-node-label {
+  font-size: 9.5px;
+  font-weight: 600;
+  color: var(--text-secondary, #bcbcbc);
+}
+@keyframes dvp-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-primary, #00cc65) 40%, transparent); }
+  50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--color-primary, #00cc65) 0%, transparent); }
+}
+.dvp-btn-claim-all.is-success {
+  background: #10b981;
+  color: #fff;
+}
+
 .dvp-status-strip {
   display: flex;
   align-items: center;
@@ -1538,6 +1668,7 @@ const createLedgerModal = (ctx, Button) => {
       const stats = ref({ totalSuccess: 0, savedMoney: 0, recentLogs: [] });
       const streakDays = ref(0);
       const vipExpiry = ref('--');
+      const claimPhase = ref('idle');
 
       const refresh = async () => {
         loading.value = true;
@@ -1572,12 +1703,16 @@ const createLedgerModal = (ctx, Button) => {
 
       const handleClaimFromModal = async () => {
         loading.value = true;
+        claimPhase.value = "running";
         try {
           await maybeAutoClaim(ctx, true);
+          claimPhase.value = "success";
+          setTimeout(() => { claimPhase.value = "idle"; }, 2500);
           refreshUserInfoBestEffort(ctx);
           await refresh();
         } catch (err) {
-          ctx.toast.danger(getApiErrorMessage(err, '打卡失败'));
+          claimPhase.value = "idle";
+          ctx.toast.danger(getApiErrorMessage(err, "打卡失败"));
         } finally {
           loading.value = false;
         }
@@ -1604,7 +1739,7 @@ const createLedgerModal = (ctx, Button) => {
                 h(
                   'button',
                   { class: 'dvp-modal-close', title: '关闭', onClick: () => { visible.value = false; } },
-                  '✕',
+                  iconSvg(h, ICONS.close, { size: 14 }),
                 ),
               ]),
               // Body
@@ -1613,7 +1748,7 @@ const createLedgerModal = (ctx, Button) => {
                 h('div', { class: 'dvp-stats-grid' }, [
                   h('div', { class: 'dvp-stat-card stat-claim' }, [
                     h('div', { class: 'dvp-stat-top' }, [
-                      h('span', null, '🎁'),
+                      iconSvg(h, ICONS.gift, { size: 13 }),
                       h('span', null, '累计打卡'),
                     ]),
                     h('div', { class: 'dvp-stat-value' }, `${stats.value.totalSuccess} 天`),
@@ -1621,7 +1756,7 @@ const createLedgerModal = (ctx, Button) => {
                   ]),
                   h('div', { class: 'dvp-stat-card stat-streak' }, [
                     h('div', { class: 'dvp-stat-top' }, [
-                      h('span', null, '🔥'),
+                      iconSvg(h, ICONS.flame, { size: 13 }),
                       h('span', null, '连续签到'),
                     ]),
                     h('div', { class: 'dvp-stat-value' }, `${streakDays.value} 天`),
@@ -1629,17 +1764,42 @@ const createLedgerModal = (ctx, Button) => {
                   ]),
                   h('div', { class: 'dvp-stat-card stat-save' }, [
                     h('div', { class: 'dvp-stat-top' }, [
-                      h('span', null, '💰'),
+                      iconSvg(h, ICONS.coin, { size: 13 }),
                       h('span', null, '累计节省约'),
                     ]),
                     h('div', { class: 'dvp-stat-value' }, `¥${stats.value.savedMoney}`),
                     h('div', { class: 'dvp-stat-sub' }, '折合会员费估算'),
                   ]),
                 ]),
+                                // 7天连胜里程碑轨道 (Streak Rail)
+                h("div", { class: "dvp-streak-rail" }, [
+                  h("div", { class: "dvp-streak-rail-header" }, [
+                    h("div", { class: "dvp-streak-rail-title" }, [
+                      iconSvg(h, ICONS.flame, { size: 12 }),
+                      h("span", null, "7天连胜里程碑"),
+                    ]),
+                    h("span", { class: "dvp-muted" }, `当前连续 ${streakDays.value} 天`),
+                  ]),
+                  h("div", { class: "dvp-streak-nodes" }, [
+                    ...[1, 2, 3, 4, 5, 6, 7].map((dayNum) => {
+                      const cur = streakDays.value;
+                      const isDone = cur >= dayNum;
+                      const isActive = cur + 1 === dayNum;
+                      return h("div", {
+                        class: ["dvp-streak-node", isDone ? "is-done" : isActive ? "is-active" : ""],
+                        key: dayNum,
+                        title: isDone ? `第 ${dayNum} 天已完成打卡` : `连胜第 ${dayNum} 天里程碑`,
+                      }, [
+                        h("span", { class: "dvp-node-dot" }, isDone ? iconSvg(h, ICONS.check, { size: 10 }) : String(dayNum)),
+                        h("span", { class: "dvp-node-label" }, `D${dayNum}`),
+                      ]);
+                    }),
+                  ]),
+                ]),
                 // 状态胶囊条
                 h('div', { class: 'dvp-status-strip' }, [
                   h('div', { class: 'dvp-status-left' }, [
-                    h('span', null, '👑'),
+                    iconSvg(h, ICONS.crown, { size: 14 }),
                     h('span', null, `畅听 VIP · ${vipExpiry.value}`),
                   ]),
                   h('div', { class: 'dvp-status-user' }, `用户: ${readUserId(ctx) || '当前账号'}`),
@@ -1710,13 +1870,17 @@ const createLedgerModal = (ctx, Button) => {
                 h(
                   'button',
                   {
-                    class: 'dvp-btn-claim-all',
-                    disabled: loading.value,
+                    class: ['dvp-btn-claim-all', claimPhase.value === 'success' ? 'is-success' : ''],
+                    disabled: loading.value || claimPhase.value === 'success',
                     onClick: handleClaimFromModal,
                   },
                   [
-                    iconSvg(h, ctx.icons.iconSparkles || ctx.icons.iconGift, { size: 14 }),
-                    loading.value ? '打卡处理中...' : '立即全套打卡',
+                    claimPhase.value === 'running'
+                      ? iconSvg(h, ICONS.loader, { size: 14, className: 'dvp-spin' })
+                      : claimPhase.value === 'success'
+                      ? iconSvg(h, ICONS.check, { size: 14 })
+                      : iconSvg(h, ICONS.sparkles, { size: 14 }),
+                    h('span', null, claimPhase.value === 'running' ? '正在全套打卡...' : claimPhase.value === 'success' ? '今日打卡已完成' : '立即全套打卡'),
                   ],
                 ),
               ]),

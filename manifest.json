@@ -1,8 +1,8 @@
 {
   "id": "daily-vip-claim",
   "name": "每日畅听会员领取",
-  "version": "2.2.0",
-  "description": "每日领取 1 天畅听会员、特权升级与概念版打卡：底栏/标题栏双快捷入口、多账号切换无缝守护、SQLite 本地流水账本与 EchoMusic 原生设计风格",
+  "version": "2.3.0",
+  "description": "每日领取 1 天畅听会员、特权升级与概念版打卡：黑曜石连胜轨道、触觉动态变形按钮、底栏/标题栏双入口、多账号切换无缝守护与全矢量零 Emoji 设计",
   "author": "xhd2005",
   "icon": "logo.png",
   "main": "index.js",
@@ -13,6 +13,6 @@
     "kugouVerification": true
   },
   "requires": {
-    "echoMusicVersion": ">=2.3.2-beta.9"
+    "echoMusicVersion": ">=2.3.2-beta.17"
   }
 }
