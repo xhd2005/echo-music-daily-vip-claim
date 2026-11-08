@@ -156,18 +156,20 @@ const initLedgerDb = async (ctx) => {
   return null;
 };
 
-// 冷启动历史记录自动回填（若本地账本为空，从酷狗当月已打卡接口同步）
+// 冷启动历史记录自动回填（若当前账号本地账本为空，从酷狗当月已打卡接口同步）
 const backfillLedgerFromMonthRecords = async (ctx, userId = '') => {
   if (!ledgerDb) return;
   try {
-    const countRes = await ledgerDb.get('SELECT COUNT(*) AS total FROM claim_ledger');
+    const uid = String(userId || readUserId(ctx) || '').trim();
+    const countRes = uid
+      ? await ledgerDb.get('SELECT COUNT(*) AS total FROM claim_ledger WHERE user_id = ?', [uid])
+      : await ledgerDb.get('SELECT COUNT(*) AS total FROM claim_ledger');
     const existingCount = Number(countRes?.row?.total || 0);
     if (existingCount > 0) return;
 
     const records = await getMonthRecordsCached(ctx).catch(() => []);
     if (!Array.isArray(records) || records.length === 0) return;
 
-    const uid = String(userId || readUserId(ctx) || '');
     for (const rec of records) {
       if (!rec || !rec.date) continue;
       const claimedAt = new Date(`${rec.date} 12:00:00`).getTime() || Date.now();
@@ -188,7 +190,7 @@ const backfillLedgerFromMonthRecords = async (ctx, userId = '') => {
         ],
       );
     }
-    console.info(`[daily-vip-claim] 已自动同步 ${records.length} 条当月打卡历史到本地账本`);
+    console.info(`[daily-vip-claim] 已自动同步账号 ${uid || '默认'} 的 ${records.length} 条当月打卡历史到本地账本`);
   } catch (err) {
     console.warn('[daily-vip-claim] 自动同步当月历史打卡记录异常:', err);
   }
@@ -329,6 +331,22 @@ const runConceptEditionTasks = async (ctx) => {
   return adSuccess || listenSuccess;
 };
 
+// 从风控错误体中提取酷狗验证码 challenge（适配宿主 ctx.kugouVerification.request 签名）
+const extractVerificationChallenge = (err) => {
+  const body = err?.response?.body;
+  const data = body?.data && typeof body.data === 'object' ? body.data : body;
+  const ssaCode = String(
+    data?.ssaCode ?? data?.ssa_code ?? body?.ssaCode ?? body?.ssa_code ?? '',
+  ).trim();
+  const eventId = String(
+    data?.eventId ?? data?.event_id ?? body?.eventId ?? body?.event_id ?? '',
+  ).trim();
+  if (ssaCode && eventId) return { ssaCode, eventId };
+  if (ssaCode) return ssaCode;
+  if (eventId) return eventId;
+  return { ssaCode: 'claim_vip', eventId: 'claim_vip' };
+};
+
 const claimOnce = (ctx, progressCallback) => {
   if (claimInFlight) return claimInFlight;
   claimInFlight = (async () => {
@@ -344,17 +362,23 @@ const claimOnce = (ctx, progressCallback) => {
     } catch (err) {
       claimError = err;
       const errCode = Number(err?.response?.body?.error_code || err?.response?.body?.errcode);
+      const verifyFn =
+        typeof ctx.kugouVerification?.request === 'function'
+          ? (challenge) => ctx.kugouVerification.request(challenge)
+          : typeof ctx.kugouVerification?.requestVerification === 'function'
+            ? () =>
+                ctx.kugouVerification.requestVerification({
+                  scene: 'claim_vip',
+                  message: '领取每日畅听会员需进行安全验证',
+                })
+            : null;
       if (
         (errCode === 10008 || errCode === 10009 || errCode === 10010 || errCode === 20028) &&
-        ctx.kugouVerification &&
-        typeof ctx.kugouVerification.requestVerification === 'function'
+        verifyFn
       ) {
         try {
           ctx.toast?.info?.('检测到安全验证，正在调起验证...');
-          await ctx.kugouVerification.requestVerification({
-            scene: 'claim_vip',
-            message: '领取每日畅听会员需进行安全验证',
-          });
+          await verifyFn(extractVerificationChallenge(err));
           await ctx.kugou.user.claimDayVip(today);
           claimError = null;
         } catch (verifyErr) {
@@ -822,7 +846,7 @@ const createClaimState = (ctx, onAfterClaim) => {
       return;
     }
     isClaiming.value = true;
-    const runTask = ensureTaskRun(ctx, 'running', { progress: { label: '正在执行打卡...' } });
+    const runTask = startClaimTask(ctx, { progress: { label: '正在执行打卡...' } });
     try {
       await claimOnce(ctx, (stepLabel) => {
         runTask?.update?.({ progress: { label: stepLabel } });
@@ -1895,7 +1919,7 @@ const createLedgerModal = (ctx, Button) => {
 // 领取卡片（variant: 'card' 独立卡片样式 | 'inline' 贴会员状态卡样式）
 // 不依赖宿主全局 Icon（自建迷你 app 中不可解析），统一用内联 SVG。
 const createClaimCard = (ctx, Button) => {
-  const { h, defineComponent, ref, onMounted } = ctx.vue;
+  const { h, defineComponent, ref, onMounted, onUnmounted } = ctx.vue;
 
   const renderRecords = (state) => [
     h('div', { class: 'dvp-records-head' }, [
@@ -1946,13 +1970,15 @@ const createClaimCard = (ctx, Button) => {
       const claimedToday = ref(false);
       const streakDays = ref(0);
       const savedMoney = ref(0);
+      let unsubUser = null;
 
       const refreshStatus = async () => {
         vipExpiry.value = formatExpiryText(readTvipEndTime(ctx));
         try {
+          const uid = readUserId(ctx) || userVipState.userId;
           const [records, ledger] = await Promise.all([
             getMonthRecordsCached(ctx),
-            getLedgerStats(userVipState.userId),
+            getLedgerStats(uid),
           ]);
           monthCount.value = records.length;
           claimedToday.value = isTodayClaimed(records);
@@ -1972,6 +1998,32 @@ const createClaimCard = (ctx, Button) => {
       onMounted(async () => {
         loggedIn.value = await isLoggedInCached(ctx);
         if (loggedIn.value !== false) await refreshStatus();
+        try {
+          const userStore = ctx.pinia?._s?.get('user');
+          if (userStore && typeof userStore.$subscribe === 'function') {
+            let prevUid = String(userStore.info?.userid ?? userStore.info?.userId ?? '');
+            let prevLogged = Boolean(userStore.isLoggedIn);
+            unsubUser = userStore.$subscribe(async () => {
+              const curUid = String(userStore.info?.userid ?? userStore.info?.userId ?? '');
+              const curLogged = Boolean(userStore.isLoggedIn);
+              if (curUid !== prevUid || curLogged !== prevLogged) {
+                prevUid = curUid;
+                prevLogged = curLogged;
+                loggedIn.value = curLogged;
+                if (curLogged) await refreshStatus();
+              }
+            });
+          }
+        } catch {}
+      });
+
+      onUnmounted(() => {
+        if (typeof unsubUser === 'function') {
+          try {
+            unsubUser();
+          } catch {}
+          unsubUser = null;
+        }
       });
 
       const statusParts = () => {
@@ -2044,11 +2096,11 @@ const createClaimCard = (ctx, Button) => {
   });
 };
 
-// ---- 个人中心注入（自愈式） ----
+// ---- 个人中心注入（自愈式，同时兼容 EchoMusic v2.3.2+ 新版 .profile-details 与旧版布局） ----
 // 宿主 Vue 重渲染会抹掉不在 vnode 列表里的 DOM（注入容器），
 // ctx.ui.mount 的 disposer 由运行时自动注册、无法单独收回，
 // 因此这里自建迷你 app + MutationObserver 检测容器丢失后重挂，
-// 保证卡片长期稳定存在于「会员状态」下方。
+// 保证卡片长期稳定存在于个人中心「账号概况 / 会员状态」下方。
 
 const injectProfileClaim = (ctx, ClaimCard) => {
   const MOUNT_ID = 'daily-vip-claim-profile';
@@ -2067,26 +2119,47 @@ const injectProfileClaim = (ctx, ClaimCard) => {
     current = null;
   };
 
-  const isAnchor = (el) => {
-    // 会员状态容器：.profile-page 内、直接父级为 md:col-span-2、
-    // 含 rounded-2xl 会员卡子元素，且当前可见
-    if (!el.isConnected || el.offsetParent === null) return false;
-    if (!el.classList.contains('space-y-2')) return false;
-    if (!el.closest('.profile-page')) return false;
-    const parent = el.parentElement;
-    if (!parent || !parent.classList.contains('md:col-span-2')) return false;
-    return el.querySelector(':scope > div.rounded-2xl') != null;
+  // 查找个人中心挂载目标：
+  // 1. 新版 EchoMusic (v2.3.2 / v2.3.3-beta.1): .profile-page 下的 section.profile-details（挂载在其正下方作为独立卡片）
+  // 2. 旧版 EchoMusic: .profile-page 下 md:col-span-2 内的 div.space-y-2（追加为 inline 卡片）或 .profile-view .profile-header
+  const findProfileTarget = () => {
+    const details = document.querySelector('.profile-page .profile-details');
+    if (details && details.isConnected && details.offsetParent !== null && details.parentElement) {
+      return { anchor: details, mode: 'after', variant: 'card' };
+    }
+    const legacySpaces = document.querySelectorAll('div.space-y-2');
+    for (const el of legacySpaces) {
+      if (
+        el.isConnected &&
+        el.offsetParent !== null &&
+        el.closest('.profile-page') &&
+        el.parentElement?.classList?.contains('md:col-span-2') &&
+        el.querySelector(':scope > div.rounded-2xl') != null
+      ) {
+        return { anchor: el, mode: 'append', variant: 'inline' };
+      }
+    }
+    const legacyHeader = document.querySelector('.profile-view .profile-header');
+    if (legacyHeader && legacyHeader.isConnected && legacyHeader.offsetParent !== null && legacyHeader.parentElement) {
+      return { anchor: legacyHeader, mode: 'after', variant: 'card' };
+    }
+    return null;
   };
 
-  const mountInto = (anchor) => {
+  const mountInto = ({ anchor, mode, variant }) => {
     if (current) return;
     const container = document.createElement('div');
     container.className = 'echo-plugin-mount dvp-profile-mount';
     container.setAttribute('data-plugin-id', 'daily-vip-claim');
     container.setAttribute('data-plugin-mount', MOUNT_ID);
-    anchor.appendChild(container);
+    if (mode === 'after') {
+      container.style.marginTop = '20px';
+      anchor.insertAdjacentElement('afterend', container);
+    } else {
+      anchor.appendChild(container);
+    }
 
-    const app = ctx.vue.createApp(ClaimCard, { variant: 'inline' });
+    const app = ctx.vue.createApp(ClaimCard, { variant });
     if (ctx.pinia) app.use(ctx.pinia);
     app.config.errorHandler = (error, _instance, info) => {
       console.warn('[daily-vip-claim] 注入组件渲染错误:', info, error);
@@ -2112,12 +2185,9 @@ const injectProfileClaim = (ctx, ClaimCard) => {
     if (mounted && mounted.isConnected) return;
     // 容器被宿主重渲染抹掉 → 释放旧实例，等新 anchor 出现再挂
     disposeCurrent();
-    const anchors = document.querySelectorAll('div.space-y-2');
-    for (const anchor of anchors) {
-      if (isAnchor(anchor)) {
-        mountInto(anchor);
-        return;
-      }
+    const target = findProfileTarget();
+    if (target) {
+      mountInto(target);
     }
   };
 
@@ -2347,6 +2417,9 @@ export function activate(ctx) {
           monthRecordCache.at = 0;
           console.info("[daily-vip-claim] 感知到账号会话切换:", curUid || "未登录");
           void refreshUserInfoBestEffort(ctx);
+          if (curLoggedIn && curUid) {
+            void backfillLedgerFromMonthRecords(ctx, curUid);
+          }
           void updateBadges(ctx);
         }
       });
