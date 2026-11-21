@@ -36,6 +36,11 @@
 
 ## 🔧 更新日志
 
+- **v2.5.1**（2026-11-21）：
+  - **修复「特权升级」与「听歌打卡」失效及原因不透明**：
+    - `特权升级` 精准识别已升级 / 已享高阶特权返回码（`297001` / `297002` 及语义文案）并正确标记为「今日已升级」，真实失败时保留并展示服务端返回原因。
+    - `广告打卡` 支持 `GET /youth/vip` ➔ `POST /youth/vip` 回退并严格校验业务状态码；`听歌打卡` 自动读取当前播放曲目 `mixSongId` 并支持 `GET /youth/listen/song` ➔ `POST /youth/listen/song` ➔ 宿主原生 `ctx.kugou.user.reportListeningEvent` + `uploadPlayHistory` 三级回退。
+    - 4 步进度卡在单步失败时直接显示具体失败原因并提供独立 **`重试`** 按钮，无需重跑已成功步骤。
 - **v2.5.0**（2026-11-21）：
   - **P0 缺陷修复**：补齐 `updateBadges` 关闭播放栏胶囊时的 `unregisterPlayerbar` 卸载分支，改为单次注册 + 响应式 `badge` 驱动；封装 `syncAutoClaimScheduler` 让「启动后自动领取」开关即时生效无需重启；统一标题栏与底栏点击均打开原生 `Dialog` 账本（消除误触静默打卡）；`maybeAutoClaim`/`claimNow` 返回结构化 `{ ok, alreadyClaimed, steps, error }` 彻底修复打卡失败假阳性。
   - **第一方原生极简视觉重构**：移除全部硬编码深色色值与 `--surface-card-base`，全面改用 EchoMusic 原生主题变量与原生 `Dialog` / `Button` / `Tabs` / `Popconfirm` / `RollingNumber`；升级独立页 `ClaimPage`（`DetailPageSliverHeader` 主题变色封面 + 吸顶下划线 `Tabs` + 4 步进度 + 当月打卡日历网格 + 筛选流水）；个人中心卡片对齐 `Profile.vue` 无框轻底色与柔和胶囊标签；新增「启用概念版附加打卡任务」设置开关并暴露 `globalThis.__echoMusicDailyVip` 跨插件状态桥。

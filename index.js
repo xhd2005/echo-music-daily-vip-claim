@@ -1,8 +1,8 @@
-// 每日畅听会员领取插件 (v2.5.0)
+// 每日畅听会员领取插件 (v2.5.1)
 // 通过 ctx.kugou 复用宿主登录态调用酷狗 API（插件不接触用户令牌），
 // 领取 1 天畅听会员（含特权升级与可选概念版打卡），提供 EchoMusic 原生极简 UI：
 // - 独立主页（SliverHeader + 吸顶下划线 Tabs「今日与月历」/「领取流水」+ 当月打卡日历网格 + Popconfirm 清理）
-// - 宿主原生 Dialog 畅听账本（标题栏 / 播放栏统一点击入口，展示 4 步进度与 7 天连胜轨道）
+// - 宿主原生 Dialog 畅听账本（标题栏 / 播放栏统一点击入口，展示 4 步进度、失败诊断与单步重试、7 天连胜轨道）
 // - 个人中心 .profile-details 原生轻底色嵌入卡片
 // - 插件设置项（自动领取即时启停调度、播放栏胶囊即时卸载、概念版子任务开关）
 // - globalThis.__echoMusicDailyVip 跨插件轻量状态桥
@@ -32,24 +32,83 @@ const formatTimeOfDay = (timestamp) => {
 const VIP_ERROR_HINTS = {
   131001: '今日已领取，明天再来',
   20018: '登录已过期，请重新登录',
+  297001: '今日特权已升级',
+  297002: '当前已享高阶特权，无需重复升级',
+};
+
+const ALREADY_SATISFIED_CODES = new Set([131001, 297001, 297002]);
+const ALREADY_SATISFIED_RE = /已领取|已升级|无需升级|已完成|已是|已经|重复|上限|次数已用完/i;
+
+const extractApiPayload = (resOrErr) => {
+  if (!resOrErr || typeof resOrErr !== 'object') return null;
+  if (resOrErr.response && typeof resOrErr.response === 'object') {
+    if (resOrErr.response.body && typeof resOrErr.response.body === 'object') {
+      return resOrErr.response.body;
+    }
+    if (resOrErr.response.data && typeof resOrErr.response.data === 'object') {
+      return resOrErr.response.data;
+    }
+  }
+  if (resOrErr.body && typeof resOrErr.body === 'object') return resOrErr.body;
+  return resOrErr;
 };
 
 const getApiErrorMessage = (error, fallback) => {
-  const body = error?.response?.body;
-  const msg = body?.error_msg ?? body?.msg;
+  const body = extractApiPayload(error);
+  const msg = body?.error_msg ?? body?.msg ?? body?.errmsg ?? body?.data?.msg;
   if (typeof msg === 'string' && msg.trim()) return msg.trim();
-  const code = body?.error_code ?? body?.errcode;
-  if (code != null && Number(code) !== 0) {
+  const code = body?.error_code ?? body?.errcode ?? body?.code;
+  if (code != null && Number(code) !== 0 && Number(code) !== 200) {
     const hint = VIP_ERROR_HINTS[Number(code)];
     if (hint) return hint;
+    return `${fallback}（错误码 ${code}）`;
   }
   const ownMsg = error instanceof Error ? error.message.trim() : '';
   if (ownMsg && !ownMsg.startsWith('API Error:')) return ownMsg;
   return `${fallback}，请稍后重试`;
 };
 
-const isClaim131001 = (error) =>
-  Number(error?.response?.body?.error_code ?? error?.response?.body?.errcode) === 131001;
+const isClaim131001 = (error) => {
+  const body = extractApiPayload(error);
+  return Number(body?.error_code ?? body?.errcode) === 131001;
+};
+
+const isAlreadySatisfiedResponse = (resOrErr) => {
+  const body = extractApiPayload(resOrErr);
+  const code = Number(body?.error_code ?? body?.errcode ?? body?.code);
+  if (Number.isFinite(code) && ALREADY_SATISFIED_CODES.has(code)) return true;
+  const msg = String(
+    body?.error_msg ?? body?.msg ?? body?.errmsg ?? (resOrErr instanceof Error ? resOrErr.message : ''),
+  ).trim();
+  return Boolean(msg && ALREADY_SATISFIED_RE.test(msg));
+};
+
+const evaluateInternalApiResponse = (res, fallbackMsg) => {
+  if (!res || typeof res !== 'object') {
+    return { ok: false, already: false, detail: `${fallbackMsg}（无响应）` };
+  }
+  const body = res.body && typeof res.body === 'object' ? res.body : res;
+  const codeRaw = body?.error_code ?? body?.errcode ?? body?.code;
+  const codeNum = codeRaw !== undefined && codeRaw !== null && codeRaw !== '' ? Number(codeRaw) : null;
+  const statusVal = body?.status;
+  const msg = String(body?.error_msg ?? body?.msg ?? body?.errmsg ?? '').trim();
+
+  if (isAlreadySatisfiedResponse(res)) {
+    return { ok: true, already: true, detail: msg || '今日已完成' };
+  }
+  if (statusVal === 0 || (codeNum !== null && Number.isFinite(codeNum) && codeNum !== 0 && codeNum !== 200)) {
+    const hint = codeNum !== null ? VIP_ERROR_HINTS[codeNum] : '';
+    return {
+      ok: false,
+      already: false,
+      detail: msg || hint || (codeNum !== null ? `${fallbackMsg}（错误码 ${codeNum}）` : fallbackMsg),
+    };
+  }
+  if (statusVal === 1 || codeNum === 0 || Number(res.status) === 200) {
+    return { ok: true, already: false, detail: msg || '' };
+  }
+  return { ok: false, already: false, detail: msg || fallbackMsg };
+};
 
 // 构建当月打卡日历网格（周一为每周第一天）
 const buildMonthCalendar = (claimedDatesSet, failedDatesSet, baseDate = new Date()) => {
@@ -101,6 +160,13 @@ const createDefaultSteps = (enableConceptTasks = true) => ({
   conceptListen: enableConceptTasks ? 'idle' : 'skipped',
 });
 
+const createDefaultStepDetails = () => ({
+  baseVip: '',
+  upgrade: '',
+  conceptAd: '',
+  conceptListen: '',
+});
+
 const userVipState = {
   userId: '',
   tvipEndTime: null,
@@ -127,6 +193,7 @@ const createInitialRuntimeData = () => ({
   enableConceptTasks: true,
   stepsDate: formatClaimDate(),
   steps: createDefaultSteps(true),
+  stepDetails: createDefaultStepDetails(),
   playerbarBadgeText: '',
   tooltipText: '畅听VIP · 点击查看每日打卡账本',
   updatedAt: 0,
@@ -144,14 +211,27 @@ const ensureStepsForToday = () => {
     runtime.steps.upgrade = fresh.upgrade;
     runtime.steps.conceptAd = fresh.conceptAd;
     runtime.steps.conceptListen = fresh.conceptListen;
+    if (runtime.stepDetails) {
+      runtime.stepDetails.baseVip = '';
+      runtime.stepDetails.upgrade = '';
+      runtime.stepDetails.conceptAd = '';
+      runtime.stepDetails.conceptListen = '';
+    }
     runtime.lastError = '';
   }
 };
 
-const setStepStatus = (key, value) => {
+const setStepStatus = (key, value, detail) => {
   ensureStepsForToday();
   if (runtime.steps && Object.prototype.hasOwnProperty.call(runtime.steps, key)) {
     runtime.steps[key] = value;
+  }
+  if (runtime.stepDetails && Object.prototype.hasOwnProperty.call(runtime.stepDetails, key)) {
+    if (detail !== undefined) {
+      runtime.stepDetails[key] = String(detail || '');
+    } else if (value === 'idle' || value === 'running' || value === 'skipped') {
+      runtime.stepDetails[key] = '';
+    }
   }
 };
 
@@ -423,46 +503,204 @@ const fetchConceptUnionVipInfo = async (ctx, userId) => {
   return null;
 };
 
-// 全能版任务：分别上报概念版广告打卡与听歌任务
+// 提取当前播放曲目的 mixSongId（用于听歌打卡真实曲目上报，缺省回退常用公开 ID）
+const pickListenMixSongId = (ctx) => {
+  try {
+    const cur =
+      (typeof ctx.player?.getCurrentTrack === 'function' ? ctx.player.getCurrentTrack() : null) ||
+      ctx.pinia?._s?.get('player')?.currentTrack ||
+      ctx.pinia?._s?.get('player')?.currentSong ||
+      null;
+    const raw = cur?.mixSongId ?? cur?.mixsongid ?? cur?.MixSongID ?? cur?.album_audio_id;
+    const num = Number(raw);
+    if (Number.isFinite(num) && num > 0) return num;
+  } catch {}
+  return 666075191;
+};
+
+// 步骤 2：特权升级（识别“已升级 / 已享高阶特权”并保留真实错误原因）
+const runUpgradeStep = async (ctx) => {
+  setStepStatus('upgrade', 'running');
+  if (typeof ctx.kugou?.user?.upgradeDayVip !== 'function') {
+    const detail = '当前宿主版本未提供特权升级接口';
+    setStepStatus('upgrade', 'failed', detail);
+    return { ok: false, already: false, detail };
+  }
+  try {
+    const res = await ctx.kugou.user.upgradeDayVip();
+    if (res && typeof res === 'object') {
+      const evaluated = evaluateInternalApiResponse(res, '特权升级未成功');
+      if (evaluated.already) {
+        const detail = evaluated.detail || '今日已升级 / 已享高阶特权';
+        setStepStatus('upgrade', 'already', detail);
+        return { ok: true, already: true, detail };
+      }
+      if (!evaluated.ok) {
+        setStepStatus('upgrade', 'failed', evaluated.detail);
+        return { ok: false, already: false, detail: evaluated.detail };
+      }
+    }
+    setStepStatus('upgrade', 'success', '特权已升级');
+    return { ok: true, already: false, detail: '特权已升级' };
+  } catch (err) {
+    if (isAlreadySatisfiedResponse(err)) {
+      const detail = getApiErrorMessage(err, '今日特权已升级');
+      setStepStatus('upgrade', 'already', detail);
+      return { ok: true, already: true, detail };
+    }
+    const detail = getApiErrorMessage(err, '特权升级失败');
+    setStepStatus('upgrade', 'failed', detail);
+    console.warn('[daily-vip-claim] 升级失败（非阻断）:', err);
+    return { ok: false, already: false, detail };
+  }
+};
+
+// 步骤 3：概念版广告打卡（优先 GET /youth/vip，回退 POST /youth/vip，校验业务状态）
+const runConceptAdStep = async (ctx) => {
+  setStepStatus('conceptAd', 'running');
+  let lastDetail = '广告打卡接口暂不可用';
+  const attempts = [
+    () => sendInternalApiRequest(ctx, { method: 'GET', url: '/youth/vip' }),
+    () => sendInternalApiRequest(ctx, { method: 'POST', url: '/youth/vip' }),
+  ];
+  for (const attempt of attempts) {
+    try {
+      const res = await attempt();
+      const evaluated = evaluateInternalApiResponse(res, '广告打卡未成功');
+      if (evaluated.already) {
+        const detail = evaluated.detail || '今日广告打卡已完成';
+        setStepStatus('conceptAd', 'already', detail);
+        return { ok: true, already: true, detail };
+      }
+      if (evaluated.ok) {
+        const detail = evaluated.detail || '广告打卡已完成';
+        setStepStatus('conceptAd', 'success', detail);
+        return { ok: true, already: false, detail };
+      }
+      lastDetail = evaluated.detail || lastDetail;
+    } catch (e) {
+      if (isAlreadySatisfiedResponse(e)) {
+        const detail = getApiErrorMessage(e, '今日广告打卡已完成');
+        setStepStatus('conceptAd', 'already', detail);
+        return { ok: true, already: true, detail };
+      }
+      lastDetail = getApiErrorMessage(e, '广告打卡失败');
+      console.warn('[daily-vip-claim] 概念版广告打卡异常:', e);
+    }
+  }
+  setStepStatus('conceptAd', 'failed', lastDetail);
+  return { ok: false, already: false, detail: lastDetail };
+};
+
+// 步骤 4：概念版听歌打卡（GET -> POST -> 宿主 reportListeningEvent + uploadPlayHistory 三级回退）
+const runConceptListenStep = async (ctx) => {
+  setStepStatus('conceptListen', 'running');
+  const mixsongid = pickListenMixSongId(ctx);
+  let lastDetail = '听歌打卡接口暂不可用';
+
+  const internalAttempts = [
+    () =>
+      sendInternalApiRequest(ctx, {
+        method: 'GET',
+        url: '/youth/listen/song',
+        params: { mixsongid },
+      }),
+    () =>
+      sendInternalApiRequest(ctx, {
+        method: 'POST',
+        url: '/youth/listen/song',
+        data: { mixsongid },
+      }),
+  ];
+
+  for (const attempt of internalAttempts) {
+    try {
+      const res = await attempt();
+      const evaluated = evaluateInternalApiResponse(res, '听歌打卡未成功');
+      if (evaluated.already) {
+        const detail = evaluated.detail || '今日听歌打卡已完成';
+        setStepStatus('conceptListen', 'already', detail);
+        return { ok: true, already: true, detail };
+      }
+      if (evaluated.ok) {
+        const detail = evaluated.detail || '听歌打卡已完成';
+        setStepStatus('conceptListen', 'success', detail);
+        return { ok: true, already: false, detail };
+      }
+      lastDetail = evaluated.detail || lastDetail;
+    } catch (e) {
+      if (isAlreadySatisfiedResponse(e)) {
+        const detail = getApiErrorMessage(e, '今日听歌打卡已完成');
+        setStepStatus('conceptListen', 'already', detail);
+        return { ok: true, already: true, detail };
+      }
+      lastDetail = getApiErrorMessage(e, '听歌打卡失败');
+      console.warn('[daily-vip-claim] 概念版听歌打卡异常:', e);
+    }
+  }
+
+  // 回退方案：调用宿主原生听歌上报 + 播放历史同步（/user/listen/report + /playhistory/upload）
+  if (typeof ctx.kugou?.user?.reportListeningEvent === 'function') {
+    try {
+      const reportRes = await ctx.kugou.user.reportListeningEvent({
+        event: 'end',
+        mixsongid: String(mixsongid),
+        duration: 180,
+      });
+      if (typeof ctx.kugou?.user?.uploadPlayHistory === 'function') {
+        void Promise.resolve(ctx.kugou.user.uploadPlayHistory(String(mixsongid))).catch(() => {});
+      }
+      const evaluated =
+        reportRes && typeof reportRes === 'object'
+          ? evaluateInternalApiResponse(reportRes, '听歌上报未成功')
+          : { ok: true, already: false, detail: '' };
+      if (evaluated.already) {
+        const detail = evaluated.detail || '今日听歌打卡已完成';
+        setStepStatus('conceptListen', 'already', detail);
+        return { ok: true, already: true, detail };
+      }
+      if (evaluated.ok) {
+        const detail = '已通过听歌上报完成';
+        setStepStatus('conceptListen', 'success', detail);
+        return { ok: true, already: false, detail };
+      }
+      lastDetail = evaluated.detail || lastDetail;
+    } catch (e) {
+      if (isAlreadySatisfiedResponse(e)) {
+        const detail = getApiErrorMessage(e, '今日听歌打卡已完成');
+        setStepStatus('conceptListen', 'already', detail);
+        return { ok: true, already: true, detail };
+      }
+      lastDetail = getApiErrorMessage(e, '听歌上报失败');
+      console.warn('[daily-vip-claim] 宿主听歌上报异常:', e);
+    }
+  }
+
+  setStepStatus('conceptListen', 'failed', lastDetail);
+  return { ok: false, already: false, detail: lastDetail };
+};
+
+// 全能版任务：分别执行概念版广告打卡与听歌打卡
 const runConceptEditionTasks = async (ctx, onStepUpdate) => {
-  let adSuccess = false;
-  let listenSuccess = false;
+  onStepUpdate?.('conceptAd', 'running', '步骤 3/4：正在执行概念版广告打卡...');
+  const adRes = await runConceptAdStep(ctx);
+  onStepUpdate?.('conceptAd', adRes.already ? 'already' : adRes.ok ? 'success' : 'failed', undefined, adRes.detail);
 
-  // 1. 概念版广告打卡
-  onStepUpdate?.('conceptAd', 'running', '正在执行概念版广告打卡...');
-  try {
-    const adRes = await sendInternalApiRequest(ctx, {
-      method: 'POST',
-      url: '/youth/vip',
-    });
-    if (adRes?.status === 200 || adRes?.body?.status === 1 || adRes?.body?.code === 0) {
-      adSuccess = true;
-    }
-  } catch (e) {
-    console.warn('[daily-vip-claim] 概念版广告打卡异常:', e);
-  }
-  onStepUpdate?.('conceptAd', adSuccess ? 'success' : 'failed');
-
-  // 2. 概念版听歌打卡
-  onStepUpdate?.('conceptListen', 'running', '正在执行概念版听歌打卡...');
-  try {
-    const listenRes = await sendInternalApiRequest(ctx, {
-      method: 'POST',
-      url: '/youth/listen/song',
-      data: { mixsongid: 666075191 },
-    });
-    if (listenRes?.status === 200 || listenRes?.body?.status === 1 || listenRes?.body?.code === 0) {
-      listenSuccess = true;
-    }
-  } catch (e) {
-    console.warn('[daily-vip-claim] 概念版听歌打卡异常:', e);
-  }
-  onStepUpdate?.('conceptListen', listenSuccess ? 'success' : 'failed');
+  onStepUpdate?.('conceptListen', 'running', '步骤 4/4：正在执行概念版听歌打卡...');
+  const listenRes = await runConceptListenStep(ctx);
+  onStepUpdate?.(
+    'conceptListen',
+    listenRes.already ? 'already' : listenRes.ok ? 'success' : 'failed',
+    undefined,
+    listenRes.detail,
+  );
 
   return {
-    adSuccess,
-    listenSuccess,
-    ok: adSuccess || listenSuccess,
+    adSuccess: adRes.ok,
+    listenSuccess: listenRes.ok,
+    adDetail: adRes.detail,
+    listenDetail: listenRes.detail,
+    ok: adRes.ok || listenRes.ok,
   };
 };
 
@@ -541,11 +779,11 @@ const claimOnce = (ctx, progressCallback, options = {}) => {
         }
       }
       if (claimError && isClaim131001(claimError)) {
-        setStepStatus('baseVip', 'already');
+        setStepStatus('baseVip', 'already', '今日已领取');
       } else if (claimError) {
         const durationMs = Date.now() - t0;
         const errMsg = getApiErrorMessage(claimError, '领取失败');
-        setStepStatus('baseVip', 'failed');
+        setStepStatus('baseVip', 'failed', errMsg);
         setStepStatus('upgrade', 'skipped');
         setStepStatus('conceptAd', 'skipped');
         setStepStatus('conceptListen', 'skipped');
@@ -564,28 +802,22 @@ const claimOnce = (ctx, progressCallback, options = {}) => {
     }
 
     progressCallback?.('步骤 2/4：正在升级概念特权...');
-    setStepStatus('upgrade', 'running');
-    try {
-      await ctx.kugou.user.upgradeDayVip();
-      upgradeSuccess = true;
-      setStepStatus('upgrade', 'success');
-    } catch (upgradeError) {
-      setStepStatus('upgrade', 'failed');
-      console.warn('[daily-vip-claim] 升级失败（非阻断）:', upgradeError);
-    }
+    const upgradeRes = await runUpgradeStep(ctx);
+    upgradeSuccess = upgradeRes.ok;
 
     if (enableConceptTasks) {
       try {
-        const conceptRes = await runConceptEditionTasks(ctx, (stepKey, state, label) => {
-          setStepStatus(stepKey, state);
+        const conceptRes = await runConceptEditionTasks(ctx, (stepKey, state, label, detail) => {
+          setStepStatus(stepKey, state, detail);
           if (label) progressCallback?.(label);
         });
         adSuccess = conceptRes.adSuccess;
         listenSuccess = conceptRes.listenSuccess;
         conceptTaskSuccess = conceptRes.ok;
       } catch (conceptError) {
-        setStepStatus('conceptAd', 'failed');
-        setStepStatus('conceptListen', 'failed');
+        const errMsg = getApiErrorMessage(conceptError, '概念打卡异常');
+        setStepStatus('conceptAd', 'failed', errMsg);
+        setStepStatus('conceptListen', 'failed', errMsg);
         console.warn('[daily-vip-claim] 概念打卡异常（非阻断）:', conceptError);
       }
     } else {
@@ -1207,6 +1439,46 @@ const maybeAutoClaim = async (ctx, manual = false) => {
 
 const claimNow = (ctx) => maybeAutoClaim(ctx, true);
 
+// 单步重试（仅重跑指定失败步骤，避免重复执行已成功步骤）
+const retrySingleStep = async (ctx, stepKey) => {
+  if (runtime.isClaiming) return { ok: false, error: '当前有打卡任务执行中' };
+  const ok = await isLoggedInCached(ctx);
+  if (ok === false) {
+    ctx.toast?.info?.('请先登录后再重试');
+    return { ok: false, error: '未登录' };
+  }
+  if (stepKey === 'baseVip') {
+    return await claimNow(ctx);
+  }
+  runtime.isClaiming = true;
+  try {
+    let res;
+    let label = '';
+    if (stepKey === 'upgrade') {
+      label = '特权升级';
+      res = await runUpgradeStep(ctx);
+    } else if (stepKey === 'conceptAd') {
+      label = '广告打卡';
+      res = await runConceptAdStep(ctx);
+    } else if (stepKey === 'conceptListen') {
+      label = '听歌打卡';
+      res = await runConceptListenStep(ctx);
+    } else {
+      return { ok: false, error: '未知步骤' };
+    }
+    if (res.ok) {
+      if (res.already) ctx.toast?.info?.(`${label}：${res.detail || '今日已完成'}`);
+      else ctx.toast?.success?.(`${label}：${res.detail || '已完成'}`);
+    } else {
+      ctx.toast?.danger?.(`${label}未成功：${res.detail || '请稍后重试'}`);
+    }
+    await updateBadges(ctx);
+    return res;
+  } finally {
+    runtime.isClaiming = false;
+  }
+};
+
 // ---- EchoMusic 第一方原生极简样式（零硬编码深色色值、零未编译 Tailwind 类） ----
 
 const CSS = `
@@ -1473,6 +1745,7 @@ const CSS = `
   flex-direction: column;
   gap: 1px;
   min-width: 0;
+  flex: 1;
 }
 
 .dvp-step-name {
@@ -1487,6 +1760,9 @@ const CSS = `
 .dvp-step-state {
   font-size: 11px;
   color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dvp-step-item.is-done .dvp-step-state {
@@ -1499,6 +1775,31 @@ const CSS = `
 
 .dvp-step-item.is-failed .dvp-step-state {
   color: var(--state-danger);
+}
+
+.dvp-step-retry {
+  margin-left: auto;
+  flex-shrink: 0;
+  height: 24px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--radius-control);
+  background: var(--control-hover-bg);
+  color: var(--color-text-main);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+.dvp-step-retry:hover {
+  background: var(--control-active-bg);
+  color: var(--color-primary-text);
+}
+
+.dvp-step-retry:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* 错误提示横幅 */
@@ -2148,7 +2449,15 @@ const getStepCaption = (state, isConcept, enableConceptTasks) => {
   }
 };
 
-const renderStepStrip = (h, steps, enableConceptTasks, compact = false) =>
+const renderStepStrip = (
+  h,
+  steps,
+  enableConceptTasks,
+  compact = false,
+  stepDetails = null,
+  onRetryStep = null,
+  isBusy = false,
+) =>
   h(
     'div',
     { class: compact ? 'dvp-steps-grid dvp-steps-grid-compact' : 'dvp-steps-grid' },
@@ -2159,6 +2468,13 @@ const renderStepStrip = (h, steps, enableConceptTasks, compact = false) =>
       const isRunning = state === 'running';
       const isFailed = state === 'failed';
       const isSkipped = state === 'skipped';
+      const detailText = String(stepDetails?.[item.key] || '').trim();
+      const baseCaption = getStepCaption(state, item.isConcept, enableConceptTasks);
+      const caption = isFailed && detailText
+        ? detailText
+        : state === 'already' && detailText
+          ? detailText
+          : baseCaption;
 
       let dotChild = String(item.order);
       if (isRunning) dotChild = iconSvg(h, ICONS.loader, { size: 12, className: 'dvp-spin' });
@@ -2177,13 +2493,30 @@ const renderStepStrip = (h, steps, enableConceptTasks, compact = false) =>
             isFailed ? 'is-failed' : '',
             isSkipped ? 'is-skipped' : '',
           ],
+          title: detailText || baseCaption,
         },
         [
           h('span', { class: 'dvp-step-dot' }, dotChild),
           h('div', { class: 'dvp-step-copy' }, [
             h('span', { class: 'dvp-step-name' }, item.label),
-            h('span', { class: 'dvp-step-state' }, getStepCaption(state, item.isConcept, enableConceptTasks)),
+            h('span', { class: 'dvp-step-state' }, caption),
           ]),
+          isFailed && typeof onRetryStep === 'function'
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  class: 'dvp-step-retry',
+                  disabled: Boolean(isBusy),
+                  title: `单独重试「${item.label}」`,
+                  onClick: (e) => {
+                    e?.stopPropagation?.();
+                    onRetryStep(item.key);
+                  },
+                },
+                '重试',
+              )
+            : null,
         ],
       );
     }),
@@ -2345,7 +2678,17 @@ const createLedgerDialog = (ctx, comps) => {
                 runtime.enableConceptTasks ? '含概念版子任务' : '仅基础与升级',
               ),
             ]),
-            renderStepStrip(h, runtime.steps, runtime.enableConceptTasks, true),
+            renderStepStrip(
+              h,
+              runtime.steps,
+              runtime.enableConceptTasks,
+              true,
+              runtime.stepDetails,
+              (stepKey) => {
+                void retrySingleStep(ctx, stepKey);
+              },
+              runtime.isClaiming,
+            ),
           ]),
 
           // 3 项核心统计
@@ -2879,7 +3222,17 @@ const createClaimPage = (ctx, comps) => {
                 runtime.claimedToday ? '今日已领取' : '今日尚未领取',
               ),
             ]),
-            renderStepStrip(h, runtime.steps, runtime.enableConceptTasks, false),
+            renderStepStrip(
+              h,
+              runtime.steps,
+              runtime.enableConceptTasks,
+              false,
+              runtime.stepDetails,
+              (stepKey) => {
+                void retrySingleStep(ctx, stepKey);
+              },
+              runtime.isClaiming,
+            ),
           ]),
 
           // 4 格 KPI 统计（接入 RollingNumber）
