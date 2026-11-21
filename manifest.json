@@ -1,8 +1,8 @@
 {
   "id": "daily-vip-claim",
   "name": "每日畅听会员领取",
-  "version": "2.4.0",
-  "description": "每日领取 1 天畅听会员、特权升级与概念版打卡：黑曜石连胜轨道、触觉动态变形按钮、底栏/标题栏双入口、多账号切换无缝守护与全矢量零 Emoji 设计",
+  "version": "2.5.0",
+  "description": "EchoMusic 原生极简风每日畅听会员领取与打卡账本：4 步进度可视化、当月打卡日历网格、原生 Dialog 账本与吸顶下划线 Tabs、播放栏响应式胶囊、自动领取即时调度与 SQLite 本地多账号流水",
   "author": "xhd2005",
   "icon": "logo.png",
   "main": "index.js",
