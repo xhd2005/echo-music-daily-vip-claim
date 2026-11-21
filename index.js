@@ -1,4 +1,4 @@
-// 每日畅听会员领取插件 (v2.5.1)
+// 每日畅听会员领取插件 (v2.5.2)
 // 通过 ctx.kugou 复用宿主登录态调用酷狗 API（插件不接触用户令牌），
 // 领取 1 天畅听会员（含特权升级与可选概念版打卡），提供 EchoMusic 原生极简 UI：
 // - 独立主页（SliverHeader + 吸顶下划线 Tabs「今日与月历」/「领取流水」+ 当月打卡日历网格 + Popconfirm 清理）
@@ -592,88 +592,129 @@ const runConceptAdStep = async (ctx) => {
   return { ok: false, already: false, detail: lastDetail };
 };
 
-// 步骤 4：概念版听歌打卡（GET -> POST -> 宿主 reportListeningEvent + uploadPlayHistory 三级回退）
+// 步骤 4：听歌打卡（官方听歌事件 start+end -> 播放历史 uploadPlayHistory -> 听歌时长 reportListenTime -> 可选旧版接口）
 const runConceptListenStep = async (ctx) => {
   setStepStatus('conceptListen', 'running');
-  const mixsongid = pickListenMixSongId(ctx);
-  let lastDetail = '听歌打卡接口暂不可用';
+  const mixsongid = Number(pickListenMixSongId(ctx)) || 666075191;
+  let lastDetail = '听歌上报接口暂不可用';
+  let succeededChannel = '';
+  let alreadySatisfied = false;
 
-  const internalAttempts = [
-    () =>
-      sendInternalApiRequest(ctx, {
-        method: 'GET',
-        url: '/youth/listen/song',
-        params: { mixsongid },
-      }),
-    () =>
-      sendInternalApiRequest(ctx, {
-        method: 'POST',
-        url: '/youth/listen/song',
-        data: { mixsongid },
-      }),
-  ];
-
-  for (const attempt of internalAttempts) {
+  // 通道 1：宿主官方听歌事件上报（start -> end，严格使用数字 mixsongid）
+  if (typeof ctx.kugou?.user?.reportListeningEvent === 'function') {
     try {
-      const res = await attempt();
-      const evaluated = evaluateInternalApiResponse(res, '听歌打卡未成功');
+      await Promise.resolve(
+        ctx.kugou.user.reportListeningEvent({
+          event: 'start',
+          mixsongid,
+          duration: 0,
+        }),
+      ).catch(() => null);
+      const endRes = await ctx.kugou.user.reportListeningEvent({
+        event: 'end',
+        mixsongid,
+        duration: 180,
+      });
+      const evaluated =
+        endRes && typeof endRes === 'object'
+          ? evaluateInternalApiResponse(endRes, '听歌事件上报未成功')
+          : { ok: true, already: false, detail: '' };
       if (evaluated.already) {
-        const detail = evaluated.detail || '今日听歌打卡已完成';
-        setStepStatus('conceptListen', 'already', detail);
-        return { ok: true, already: true, detail };
+        alreadySatisfied = true;
+        succeededChannel = evaluated.detail || '今日听歌打卡已完成';
+      } else if (evaluated.ok) {
+        succeededChannel = '已通过听歌事件上报完成';
+      } else if (evaluated.detail) {
+        lastDetail = evaluated.detail;
       }
-      if (evaluated.ok) {
-        const detail = evaluated.detail || '听歌打卡已完成';
-        setStepStatus('conceptListen', 'success', detail);
-        return { ok: true, already: false, detail };
-      }
-      lastDetail = evaluated.detail || lastDetail;
     } catch (e) {
       if (isAlreadySatisfiedResponse(e)) {
-        const detail = getApiErrorMessage(e, '今日听歌打卡已完成');
-        setStepStatus('conceptListen', 'already', detail);
-        return { ok: true, already: true, detail };
+        alreadySatisfied = true;
+        succeededChannel = getApiErrorMessage(e, '今日听歌打卡已完成');
+      } else {
+        lastDetail = getApiErrorMessage(e, '听歌事件上报失败');
+        console.warn('[daily-vip-claim] reportListeningEvent 异常（将尝试其他官方通道）:', e);
       }
-      lastDetail = getApiErrorMessage(e, '听歌打卡失败');
-      console.warn('[daily-vip-claim] 概念版听歌打卡异常:', e);
     }
   }
 
-  // 回退方案：调用宿主原生听歌上报 + 播放历史同步（/user/listen/report + /playhistory/upload）
-  if (typeof ctx.kugou?.user?.reportListeningEvent === 'function') {
+  // 通道 2：宿主官方播放历史同步（GET /playhistory/upload?mxid=...）
+  if (!succeededChannel && typeof ctx.kugou?.user?.uploadPlayHistory === 'function') {
     try {
-      const reportRes = await ctx.kugou.user.reportListeningEvent({
-        event: 'end',
-        mixsongid: String(mixsongid),
-        duration: 180,
-      });
-      if (typeof ctx.kugou?.user?.uploadPlayHistory === 'function') {
-        void Promise.resolve(ctx.kugou.user.uploadPlayHistory(String(mixsongid))).catch(() => {});
-      }
+      const histRes = await ctx.kugou.user.uploadPlayHistory(mixsongid);
       const evaluated =
-        reportRes && typeof reportRes === 'object'
-          ? evaluateInternalApiResponse(reportRes, '听歌上报未成功')
+        histRes && typeof histRes === 'object'
+          ? evaluateInternalApiResponse(histRes, '播放历史上报未成功')
           : { ok: true, already: false, detail: '' };
       if (evaluated.already) {
-        const detail = evaluated.detail || '今日听歌打卡已完成';
-        setStepStatus('conceptListen', 'already', detail);
-        return { ok: true, already: true, detail };
+        alreadySatisfied = true;
+        succeededChannel = evaluated.detail || '今日听歌打卡已完成';
+      } else if (evaluated.ok) {
+        succeededChannel = '已通过播放历史上报完成';
+      } else if (evaluated.detail) {
+        lastDetail = evaluated.detail;
       }
-      if (evaluated.ok) {
-        const detail = '已通过听歌上报完成';
-        setStepStatus('conceptListen', 'success', detail);
-        return { ok: true, already: false, detail };
-      }
-      lastDetail = evaluated.detail || lastDetail;
     } catch (e) {
       if (isAlreadySatisfiedResponse(e)) {
-        const detail = getApiErrorMessage(e, '今日听歌打卡已完成');
-        setStepStatus('conceptListen', 'already', detail);
-        return { ok: true, already: true, detail };
+        alreadySatisfied = true;
+        succeededChannel = getApiErrorMessage(e, '今日听歌打卡已完成');
+      } else {
+        lastDetail = getApiErrorMessage(e, '播放历史上报失败');
+        console.warn('[daily-vip-claim] uploadPlayHistory 异常（将尝试时长上报）:', e);
       }
-      lastDetail = getApiErrorMessage(e, '听歌上报失败');
-      console.warn('[daily-vip-claim] 宿主听歌上报异常:', e);
     }
+  }
+
+  // 通道 3：宿主官方听歌等级时长上报（POST /user/grade/info）
+  if (!succeededChannel && typeof ctx.kugou?.user?.reportListenTime === 'function') {
+    try {
+      const gradeRes = await ctx.kugou.user.reportListenTime({ dSec: 0, diffSec: 180 });
+      const evaluated =
+        gradeRes && typeof gradeRes === 'object'
+          ? evaluateInternalApiResponse(gradeRes, '听歌时长上报未成功')
+          : { ok: true, already: false, detail: '' };
+      if (evaluated.already) {
+        alreadySatisfied = true;
+        succeededChannel = evaluated.detail || '今日听歌打卡已完成';
+      } else if (evaluated.ok) {
+        succeededChannel = '已通过听歌时长上报完成';
+      } else if (evaluated.detail) {
+        lastDetail = evaluated.detail;
+      }
+    } catch (e) {
+      if (isAlreadySatisfiedResponse(e)) {
+        alreadySatisfied = true;
+        succeededChannel = getApiErrorMessage(e, '今日听歌打卡已完成');
+      } else {
+        lastDetail = getApiErrorMessage(e, '听歌时长上报失败');
+        console.warn('[daily-vip-claim] reportListenTime 异常:', e);
+      }
+    }
+  }
+
+  // 通道 4：静默补报旧版概念接口（不被 ERR_EMPTY_RESPONSE 阻塞或覆盖已成功状态）
+  try {
+    const legacyRes = await sendInternalApiRequest(ctx, {
+      method: 'GET',
+      url: '/youth/listen/song',
+      params: { mixsongid },
+    });
+    if (!succeededChannel) {
+      const evaluated = evaluateInternalApiResponse(legacyRes, '听歌打卡未成功');
+      if (evaluated.already) {
+        alreadySatisfied = true;
+        succeededChannel = evaluated.detail || '今日听歌打卡已完成';
+      } else if (evaluated.ok) {
+        succeededChannel = '听歌打卡已完成';
+      }
+    }
+  } catch {
+    // 酷狗旧版 /youth/listen/song 经常返回 net::ERR_EMPTY_RESPONSE，静默忽略
+  }
+
+  if (succeededChannel) {
+    setStepStatus('conceptListen', alreadySatisfied ? 'already' : 'success', succeededChannel);
+    return { ok: true, already: alreadySatisfied, detail: succeededChannel };
   }
 
   setStepStatus('conceptListen', 'failed', lastDetail);
